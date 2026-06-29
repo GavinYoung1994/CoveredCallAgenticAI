@@ -1,0 +1,29 @@
+# ── Core orchestration ────────────────────────────────────────────────
+langgraph>=0.2.0            # graph-based agent workflow engine
+langchain-core>=0.3.0      # message types, Runnable interface used by nodes
+
+# ── Local LLM (in-process, no external server) ────────────────────────
+llama-cpp-python>=0.3.0    # loads the qwen2.5 .gguf directly on CPU/Metal
+
+# ── Long-term memory ──────────────────────────────────────────────────
+chromadb>=0.5.0            # vector store for semantic trade memory
+sentence-transformers>=3.0 # local embedding model for ChromaDB
+
+# ── Quant / data processing ───────────────────────────────────────────
+# NOTE: we intentionally do NOT use pandas_ta. Its last release imports
+# `from numpy import NaN` (removed in NumPy 2.0), and NumPy <2.0 has no
+# wheels for Python 3.13. We compute RSI/SMA/Bollinger directly instead.
+pandas>=2.2                # works on py3.13 with numpy 2.x
+numpy>=2.1                 # py3.13-compatible
+
+# ── API access ────────────────────────────────────────────────────────
+httpx>=0.27                # async Schwab market-data calls
+requests>=2.31             # token refresh + Discord webhook (sync)
+
+# ── Infrastructure ────────────────────────────────────────────────────
+python-dotenv>=1.0         # loads secrets from .env
+loguru>=0.7                # structured logging
+mcp>=1.0                   # FastMCP servers (math + schwab tool wrappers)
+
+# ── Web UI ────────────────────────────────────────────────────────────
+flask>=3.0                 # local management UI (agent chat + workflow buttons + logs)

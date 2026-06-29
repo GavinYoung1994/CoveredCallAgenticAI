@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="midnight">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Covered Call Command Center</title>
+<link rel="stylesheet" href="/static/styles.css" />
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+const WORKFLOWS = [
+  { id: "screener", icon: "🔭", name: "Run Entry Screener", desc: "Scout → Quant → News → Risk" },
+  { id: "defense",  icon: "🛡️", name: "Downside Defense Scan", desc: "Tree-of-Thoughts on holdings" },
+  { id: "report",   icon: "📊", name: "Performance Report", desc: "P&L, win rate, annualized" },
+];
+const THEMES = [
+  { id: "midnight", name: "Midnight", c: ["#5b8cff", "#0b1020"] },
+  { id: "slate",    name: "Slate",    c: ["#7c93ff", "#0f1115"] },
+  { id: "emerald",  name: "Emerald",  c: ["#2dd4bf", "#07140f"] },
+  { id: "rose",     name: "Rose",     c: ["#fb7185", "#160b12"] },
+  { id: "light",    name: "Light",    c: ["#3b6cff", "#eef1f7"] },
+];
+
+function applyTheme(id) {
+  document.documentElement.dataset.theme = id;
+  localStorage.setItem("ccc-theme", id);
+}
+
+function ThemePicker({ theme, setTheme }) {
+  return (
+    <div>
+      <div className="section-label">Theme</div>
+      <div className="theme-row">
+        {THEMES.map(t => (
+          <div key={t.id} title={t.name}
+               className={"swatch" + (theme === t.id ? " active" : "")}
+               style={{ background: `linear-gradient(135deg, ${t.c[0]}, ${t.c[1]})` }}
+               onClick={() => { setTheme(t.id); applyTheme(t.id); }} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Sidebar({ theme, setTheme }) {
+  const openWorkflow = (id) =>
+    window.open(`/workflow?wf=${id}`, `wf_${id}_${Date.now()}`,
+      "width=940,height=740,menubar=no,toolbar=no");
+  return (
+    <aside className="sidebar">
+      <div className="brand">
+        <div className="logo">📈</div>
+        <div><h1>Command Center</h1><p>Covered-Call System Manager</p></div>
+      </div>
+      <div>
+        <div className="section-label">Portfolio</div>
+        <button className="wf-btn"
+                onClick={() => window.open("/holdings", "holdings", "width=1040,height=720,menubar=no,toolbar=no")}>
+          <span className="ic">📁</span>
+          <span>My Holdings<small>Positions &amp; covered-call contracts ↗</small></span>
+        </button>
+      </div>
+      <div>
+        <div className="section-label">Workflows</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {WORKFLOWS.map(w => (
+            <button key={w.id} className="wf-btn" onClick={() => openWorkflow(w.id)}>
+              <span className="ic">{w.icon}</span>
+              <span>{w.name}<small>{w.desc} ↗ opens a window</small></span>
+            </button>
+          ))}
+        </div>
+      </div>
+      <ThemePicker theme={theme} setTheme={setTheme} />
+      <div className="spacer" />
+      <div className="hint">Workflows open in their own window with live progress &amp; logs. Ask the
+        agent anything in the chat — it can analyze trades, fetch live data, manage holdings, and even
+        run these workflows itself.</div>
+    </aside>
+  );
+}
+
+function Chat() {
+  const [messages, setMessages] = useState([
+    { who: "bot", text: "Hi! I'm your covered-call system manager. Try: \"analyze a 105 call on a $100 stock, $2 premium, 35 DTE, 25% IV\", \"find the best covered call on KO\", or \"what's my cash balance?\"" }
+  ]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const endRef = useRef(null);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, busy]);
+
+  async function send() {
+    const text = input.trim(); if (!text || busy) return;
+    // Send recent conversation so the agent has context for follow-ups.
+    const history = messages.map(m => ({ role: m.who === "user" ? "user" : "assistant", content: m.text }));
+    setInput(""); setMessages(m => [...m, { who: "user", text }]); setBusy(true);
+    try {
+      const r = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, history }) });
+      const data = await r.json();
+      setMessages(m => [...m, data.error
+        ? { who: "bot", text: "⚠️ " + data.error }
+        : { who: "bot", text: data.answer || "(no answer)", steps: data.steps }]);
+    } catch (e) { setMessages(m => [...m, { who: "bot", text: "⚠️ " + e }]); }
+    setBusy(false);
+  }
+
+  return (
+    <main className="chat">
+      <div className="chat-head">
+        <h2>Ask the manager</h2>
+        <p>Live data, exact quant analysis, holdings management, lessons &amp; reports.</p>
+      </div>
+      <div className="messages">
+        {messages.map((m, i) => (
+          <div key={i} className={"msg " + m.who}>
+            {m.text}
+            {m.steps && m.steps.length > 0 &&
+              <div className="steps">tools used: {m.steps.map((s, j) =>
+                <React.Fragment key={j}>{j > 0 ? " → " : ""}<b>{s.tool}</b></React.Fragment>)}</div>}
+          </div>
+        ))}
+        {busy && <div className="msg bot">…thinking</div>}
+        <div ref={endRef} />
+      </div>
+      <div className="composer">
+        <input value={input} placeholder="Ask anything about your covered-call system…"
+               onChange={e => setInput(e.target.value)}
+               onKeyDown={e => { if (e.key === "Enter") send(); }} autoFocus />
+        <button onClick={send} disabled={busy}>Send</button>
+      </div>
+    </main>
+  );
+}
+
+function App() {
+  const [theme, setTheme] = useState(localStorage.getItem("ccc-theme") || "midnight");
+  useEffect(() => { applyTheme(theme); }, []);
+  return <div className="app"><Sidebar theme={theme} setTheme={setTheme} /><Chat /></div>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

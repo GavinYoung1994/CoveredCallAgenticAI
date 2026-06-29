@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="midnight">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>My Holdings</title>
+<link rel="stylesheet" href="/static/styles.css" />
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect } = React;
+document.documentElement.dataset.theme = localStorage.getItem("ccc-theme") || "midnight";
+
+const fmtMoney = (v) => v == null ? "—" : "$" + Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+const fmtPct = (v) => v == null ? "—" : Number(v).toFixed(1) + "%";
+const expOf = (s) => s ? String(s).split(":")[0] : "—";
+
+function Holdings() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  async function load() {
+    setLoading(true); setErr(null);
+    try {
+      const r = await fetch("/api/holdings");
+      const d = await r.json();
+      if (d.error) setErr(d.error); else setData(d);
+    } catch (e) { setErr(String(e)); }
+    setLoading(false);
+  }
+  useEffect(() => { load(); }, []);
+
+  const positions = data?.positions || [];
+  const open = positions.filter(p => p.status === "OPEN");
+  const realized = positions.filter(p => p.status !== "OPEN")
+    .reduce((s, p) => s + (p.total_realized_pnl || 0), 0);
+
+  return (
+    <div className="wf-window">
+      <div className="wf-top">
+        <div className="logo">📁</div>
+        <div><h1>My Holdings</h1><p>Positions &amp; covered-call contract details</p></div>
+        <button className="primary" style={{ marginLeft: "auto", height: 36 }} onClick={load}>↻ Refresh</button>
+      </div>
+
+      <div className="summary ok" style={{ display: "flex", gap: 28, flexWrap: "wrap" }}>
+        <div><b>Cash</b><br />{fmtMoney(data?.cash_balance)}</div>
+        <div><b>Open positions</b><br />{open.length}</div>
+        <div><b>Closed</b><br />{positions.length - open.length}</div>
+        <div><b>Realized P&amp;L</b><br /><span style={{ color: realized >= 0 ? "var(--green)" : "var(--red)" }}>{fmtMoney(realized)}</span></div>
+      </div>
+
+      <div className="log-list" style={{ background: "transparent", fontFamily: "inherit", fontSize: 13.5 }}>
+        {loading ? <div className="empty">Loading holdings…</div>
+          : err ? <div className="empty" style={{ color: "var(--red)" }}>⚠️ {err}</div>
+          : positions.length === 0 ? <div className="empty">No positions yet. Approve a screener candidate to open one.</div>
+          : (
+            <table className="holdings-table">
+              <thead><tr>
+                <th>Symbol</th><th>Status</th><th>Shares</th><th>Cost basis</th>
+                <th>Short call</th><th>Expiration</th><th>Premium</th><th>Buffer</th>
+                <th>Realized P&amp;L</th><th>Annualized</th>
+              </tr></thead>
+              <tbody>
+                {positions.map(p => (
+                  <tr key={p.position_id}>
+                    <td><b>{p.symbol}</b><div className="muted">{p.position_id}</div></td>
+                    <td><span className={"pill " + (p.status === "OPEN" ? "open" : "closed")}>{p.status}</span></td>
+                    <td>{p.shares}</td>
+                    <td>{fmtMoney(p.stock_purchase_price)}</td>
+                    <td>{p.short_call_strike != null ? fmtMoney(p.short_call_strike) + " call" : "—"}{p.contracts ? ` ×${p.contracts}` : ""}</td>
+                    <td>{expOf(p.short_call_expiration)}</td>
+                    <td>{p.short_call_premium != null ? fmtMoney(p.short_call_premium) : "—"}</td>
+                    <td>{fmtPct(p.downside_buffer_percent)}</td>
+                    <td style={{ color: (p.total_realized_pnl || 0) > 0 ? "var(--green)" : (p.total_realized_pnl || 0) < 0 ? "var(--red)" : "inherit" }}>
+                      {p.status === "OPEN" ? "—" : fmtMoney(p.total_realized_pnl)}</td>
+                    <td title={p.return_basis ? `${fmtPct(p.return_percent)} over ${p.days_held}d (${p.return_basis})` : ""}
+                        style={{ color: (p.annualized_return_percent || 0) > 0 ? "var(--green)" : (p.annualized_return_percent || 0) < 0 ? "var(--red)" : "inherit" }}>
+                      {p.annualized_return_percent == null ? "—" : fmtPct(p.annualized_return_percent)}
+                      {p.status === "OPEN" && p.annualized_return_percent != null
+                        ? <div className="muted">premium</div> : null}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+      </div>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<Holdings />);
+</script>
+</body>
+</html>

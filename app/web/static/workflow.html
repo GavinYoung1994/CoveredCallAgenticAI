@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="midnight">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Workflow</title>
+<link rel="stylesheet" href="/static/styles.css" />
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+const WF_META = {
+  screener: { icon: "🔭", name: "Entry Screener", desc: "Scout → Quant → News → Risk Manager" },
+  defense:  { icon: "🛡️", name: "Downside Defense Scan", desc: "Tree-of-Thoughts over open holdings" },
+  report:   { icon: "📊", name: "Performance Report", desc: "P&L, win rate, annualized return" },
+};
+const wf = new URLSearchParams(location.search).get("wf") || "screener";
+const meta = WF_META[wf] || { icon: "⚙️", name: wf, desc: "" };
+
+// Match the main window's theme.
+document.documentElement.dataset.theme = localStorage.getItem("ccc-theme") || "midnight";
+
+function summarize(wf, last) {
+  if (!last) return "";
+  if (!last.ok) return "Failed: " + (last.error || "unknown error");
+  return last.summary || "Completed.";
+}
+
+function WorkflowWindow() {
+  const [status, setStatus] = useState("starting");   // starting | running | done | error
+  const [logs, setLogs] = useState([]);
+  const [summary, setSummary] = useState(null);
+  const [ok, setOk] = useState(true);
+  const cursor = useRef(0);
+  const logEnd = useRef(null);
+  const timers = useRef([]);
+
+  useEffect(() => { document.title = meta.name + " — running"; start(); return () => timers.current.forEach(clearInterval); }, []);
+  useEffect(() => { logEnd.current?.scrollIntoView(); }, [logs]);
+
+  async function start() {
+    // Capture the current log cursor so we only show THIS run's output.
+    try { cursor.current = (await (await fetch("/api/logs?since=0")).json()).cursor || 0; } catch (e) {}
+    try {
+      const r = await fetch("/api/run/" + wf, { method: "POST" });
+      if (r.status === 409) setLogs(l => [...l, sysRow("WARNING", "Another workflow is already running; showing its logs.")]);
+      else if (!r.ok) { const d = await r.json(); setStatus("error"); setOk(false); setSummary(d.error || "could not start"); return; }
+    } catch (e) { setStatus("error"); setOk(false); setSummary(String(e)); return; }
+    setStatus("running");
+    timers.current.push(setInterval(pollLogs, 1000));
+    timers.current.push(setInterval(pollStatus, 1500));
+  }
+
+  function sysRow(level, msg) {
+    return { id: "sys" + Math.random(), time: new Date().toLocaleTimeString(), level, name: "ui", msg };
+  }
+
+  async function pollLogs() {
+    try {
+      const data = await (await fetch("/api/logs?since=" + cursor.current)).json();
+      if (data.records?.length) { setLogs(l => [...l, ...data.records]); cursor.current = data.cursor; }
+    } catch (e) {}
+  }
+
+  async function pollStatus() {
+    try {
+      const data = await (await fetch("/api/status")).json();
+      if (data.running !== wf) {                       // our run finished (or never our turn)
+        const last = (data.last || {})[wf];
+        if (last) {
+          setOk(!!last.ok); setSummary(summarize(wf, last));
+          setStatus(last.ok ? "done" : "error");
+          document.title = meta.name + (last.ok ? " — done" : " — error");
+          timers.current.forEach(clearInterval); timers.current = [];
+          pollLogs();   // grab any final lines
+        }
+      }
+    } catch (e) {}
+  }
+
+  const badgeClass = status === "done" ? "badge done" : status === "error" ? "badge error" : "badge running";
+  const badgeText = status === "starting" ? "Starting…" : status === "running" ? "Running…"
+                    : status === "done" ? "Completed" : "Error";
+
+  return (
+    <div className="wf-window">
+      <div className="wf-top">
+        <div className="logo">{meta.icon}</div>
+        <div><h1>{meta.name}</h1><p>{meta.desc}</p></div>
+        <span className={badgeClass}><span className="dot"></span>{badgeText}</span>
+      </div>
+      {summary && <div className={"summary " + (ok ? "ok" : "bad")}>{summary}</div>}
+      <div className="log-list">
+        {logs.length === 0
+          ? <div className="empty">Waiting for log output…</div>
+          : logs.map((r, i) => (
+              <div className="log-row" key={r.id || i}>
+                <span className="t">{r.time}</span>
+                <span className={"lvl " + r.level}>{r.level}</span>
+                <span className="m"><span className="src">{r.name}</span> {r.msg}</span>
+              </div>
+            ))}
+        <div ref={logEnd} />
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<WorkflowWindow />);
+</script>
+</body>
+</html>

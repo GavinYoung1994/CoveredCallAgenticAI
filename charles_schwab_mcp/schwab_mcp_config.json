@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "schwab-market-data": {
+      "command": "python",
+      "args": [
+        "-u",
+        "./schwab_mcp_server.py"
+      ],
+      "comment": "Credentials are loaded from the project-root .env by token_manager.py (python-dotenv). Do not hardcode SCHWAB_APP_KEY / SCHWAB_APP_SECRET here."
+    }
+  }
+}
