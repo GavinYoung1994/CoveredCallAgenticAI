@@ -70,8 +70,9 @@ def _client() -> SchwabClient:
     )
 
 
-def _run_scout(symbols, rules=base_rules):
-    node = build_scout_node(_client(), rules=rules)
+def _run_scout(symbols, rules=base_rules, held=None):
+    # Inject held symbols explicitly so tests are deterministic (never touch the DB).
+    node = build_scout_node(_client(), rules=rules, held_symbols_provider=lambda: set(held or []))
     state = new_screener_state(
         watchlist=symbols, account_cash=100_000, run_id="r", run_timestamp="t",
     )
@@ -110,6 +111,16 @@ def test_scout_empty_watchlist():
     out = _run_scout([])
     assert out["scout_candidates"] == []
     assert any("empty watchlist" in e.lower() for e in out["errors"])
+
+
+def test_scout_skips_already_held():
+    # GOOD is already held → excluded; the others still pass (prefiltered mode).
+    out = _run_scout(["GOOD", "ILLQ", "NOOPT"], rules=PREFILTERED, held={"GOOD"})
+    passed = sorted(c["symbol"] for c in out["scout_candidates"])
+    assert "GOOD" not in passed
+    assert passed == ["ILLQ", "NOOPT"]
+    held_rej = next(r for r in out["rejected"] if r["symbol"] == "GOOD")
+    assert "Already held" in held_rej["reason"]
 
 
 def test_load_watchlist_reads_real_file():

@@ -91,14 +91,29 @@ def _resolve_current_price(client: SchwabClient, state: DefenseState, sym: str) 
         return 0.0, f"Defense quote failed for {sym}: {exc}"
 
 
+def _roll_contract_details(best: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract the human-facing details of the proposed roll-down call."""
+    if not best or "error" in best:
+        return None
+    return {
+        "strike": best.get("strike"),
+        "expiration": str(best.get("expiration_key", "")).split(":")[0] or None,
+        "days_to_expiration": best.get("days_to_expiration"),
+        "delta": best.get("delta"),
+        "premium": best.get("mark", 0.0),
+    }
+
+
 def _resolve_branch_inputs(
     client: SchwabClient, state: DefenseState, pos: Dict[str, Any], rules
-) -> Tuple[float, float, Optional[str]]:
+) -> Tuple[float, float, Optional[Dict[str, Any]], Optional[str]]:
     """Resolve the two option inputs the branch P&L needs — the current short-call
-    ask (to buy it back) and a roll-down premium — from state or the chain.
-    Returns (current_call_ask, roll_down_premium, error_or_None)."""
+    ask (to buy it back) and a roll-down premium — from state or the chain, plus
+    the details of the proposed roll-down contract (strike/expiration/DTE).
+    Returns (current_call_ask, roll_down_premium, roll_contract, error_or_None)."""
     current_call_ask = state.get("current_call_ask")
     roll_premium = state.get("roll_down_premium")
+    roll_contract: Optional[Dict[str, Any]] = None
     err = None
     if current_call_ask is None or roll_premium is None:
         try:
@@ -108,12 +123,15 @@ def _resolve_branch_inputs(
         if current_call_ask is None:
             current_call_ask = _find_call_ask_by_strike(
                 chain, pos.get("short_call_strike", 0.0), pos.get("short_call_expiration"))
+        # Always identify the best roll-down candidate for its contract details,
+        # even when the premium was injected via state.
+        best = eng.find_optimal_covered_call(
+            chain, target_delta=rules.target_delta, delta_band=rules.delta_band,
+            min_dte=rules.min_days_to_expiration, max_dte=rules.max_days_to_expiration)
+        roll_contract = _roll_contract_details(best)
         if roll_premium is None:
-            best = eng.find_optimal_covered_call(
-                chain, target_delta=rules.target_delta, delta_band=rules.delta_band,
-                min_dte=rules.min_days_to_expiration, max_dte=rules.max_days_to_expiration)
             roll_premium = best.get("mark", 0.0) if "error" not in best else 0.0
-    return float(current_call_ask or 0.0), float(roll_premium or 0.0), err
+    return float(current_call_ask or 0.0), float(roll_premium or 0.0), roll_contract, err
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -139,15 +157,17 @@ def build_defense_quant_node(
         # back to the static rule when no buffer was stored.
         threshold = _breach_threshold(pos, rules)
 
+        # drop_pct is a SIGNED change: positive = stock up, negative = stock down.
         if not (price > 0 and drop_pct <= threshold):
-            logger.info("Defense: %s drop %.1f%% within tolerance (threshold %.1f%%); no action.",
-                        sym, drop_pct, threshold)
+            logger.info("Defense: %s change %+.1f%% — within the %.1f%% downside cushion; no action.",
+                        sym, drop_pct, abs(threshold))
             return _with_errors({"current_stock_price": price, "breach_detected": False}, errors)
 
-        logger.info("Defense: %s BREACH — drop %.1f%% <= %.1f%% (premium-cushion threshold); "
-                    "generating ToT branches.", sym, drop_pct, threshold)
+        logger.info("Defense: %s BREACH — down %.1f%% exceeds the %.1f%% downside cushion; "
+                    "generating ToT branches.", sym, abs(drop_pct), abs(threshold))
 
-        current_call_ask, roll_premium, chain_err = _resolve_branch_inputs(client, state, pos, rules)
+        current_call_ask, roll_premium, roll_contract, chain_err = _resolve_branch_inputs(
+            client, state, pos, rules)
         if chain_err:
             errors.append(chain_err)
 
@@ -162,7 +182,15 @@ def build_defense_quant_node(
         branch_analysis = {
             "drop_percent": round(drop_pct, 2), "current_stock_price": price,
             "raw_cost_basis": entry, "current_call_ask": current_call_ask,
-            "roll_down_premium": roll_premium, "branches": branches,
+            "roll_down_premium": roll_premium, "roll_down_contract": roll_contract,
+            "existing_short_call": {
+                "strike": pos.get("short_call_strike"),
+                "expiration": pos.get("short_call_expiration"),
+                "original_premium": pos.get("original_premium"),
+                "shares": pos.get("shares"),
+                "buy_to_close_ask": current_call_ask,
+            },
+            "branches": branches,
         }
         return _with_errors({"current_stock_price": price, "current_call_ask": current_call_ask,
                              "breach_detected": True, "branch_analysis": branch_analysis}, errors)
@@ -230,13 +258,24 @@ def _choose_branch(llm: LocalLLM, sym: str, ba: Dict[str, Any], report: Dict[str
     a = branches.get("Branch_A_Liquidate", {})
     b = branches.get("Branch_B_Roll_Down", {})
     c = branches.get("Branch_C_Hold", {})
+    ex = ba.get("existing_short_call", {}) or {}
+    rc = ba.get("roll_down_contract") or {}
+    roll_line = (
+        f" Roll into the {rc.get('strike')} call exp {rc.get('expiration')} "
+        f"({rc.get('days_to_expiration')} days, premium ${rc.get('premium')})."
+        if rc else " (new roll-down contract details unavailable.)"
+    )
     user = (
-        f"Symbol {sym} is down {ba.get('drop_percent')}% from entry (now "
+        f"Symbol {sym} is down {abs(ba.get('drop_percent', 0))}% from entry (now "
         f"${ba.get('current_stock_price')}).\n"
+        f"Existing short call: {ex.get('strike')} strike exp {ex.get('expiration')}, "
+        f"original premium ${ex.get('original_premium')}, buy-to-close ask "
+        f"${ex.get('buy_to_close_ask')}.\n"
         f"Branch A (Hard Eject): realized cash loss ${a.get('realized_cash_loss')}, "
         f"capital freed ${a.get('capital_freed_up')}.\n"
         f"Branch B (Roll Down): net credit ${b.get('net_credit_received')}, "
-        f"valid={b.get('is_valid')}, unrealized stock loss ${b.get('unrealized_stock_loss')}.\n"
+        f"valid={b.get('is_valid')}, unrealized stock loss ${b.get('unrealized_stock_loss')}."
+        f"{roll_line}\n"
         f"Branch C (Hold): unrealized net P&L ${c.get('unrealized_net_pnl')}.\n"
         f"News sentiment: {report.get('sentiment')}, catastrophic_risk="
         f"{report.get('catastrophic_risk')}. {report.get('rationale','')}\n"
@@ -260,17 +299,28 @@ def _choose_branch(llm: LocalLLM, sym: str, ba: Dict[str, Any], report: Dict[str
 
 def _format_defense(pos, ba, report, branch, rationale) -> str:
     b = ba.get("branches", {})
+    ex = ba.get("existing_short_call", {}) or {}
+    rc = ba.get("roll_down_contract") or {}
     lines = [
         "🛡️ **Downside Defense — HUMAN DECISION REQUIRED**",
-        f"**{pos['symbol']}** is down **{ba.get('drop_percent')}%** "
+        f"**{pos['symbol']}** is down **{abs(ba.get('drop_percent', 0))}%** "
         f"(now ${ba.get('current_stock_price')}, entry ${pos.get('stock_purchase_price')}).",
         "⚠️ Autonomous trading is disabled. Review and execute manually.\n",
+        "**Current holding:**",
+        f"• {ex.get('shares') or pos.get('shares')} shares @ ${pos.get('stock_purchase_price')} "
+        f"(now ${ba.get('current_stock_price')})",
+        f"• Short call: {ex.get('strike')} strike exp "
+        f"{str(ex.get('expiration') or '').split(':')[0] or '—'}, "
+        f"original premium ${ex.get('original_premium')}, buy-to-close ask ${ex.get('buy_to_close_ask')}\n",
         f"**Recommended: {BRANCH_LABELS.get(branch, branch)}**",
         f"_{rationale}_\n",
         "**Branches evaluated:**",
         f"• A — Hard Eject: realized loss ${b.get('Branch_A_Liquidate', {}).get('realized_cash_loss')}",
         f"• B — Roll Down: net credit ${b.get('Branch_B_Roll_Down', {}).get('net_credit_received')} "
-        f"(valid={b.get('Branch_B_Roll_Down', {}).get('is_valid')})",
+        f"(valid={b.get('Branch_B_Roll_Down', {}).get('is_valid')})"
+        + (f"\n    ↳ new call: {rc.get('strike')} strike exp {rc.get('expiration')} "
+           f"({rc.get('days_to_expiration')}d, Δ{rc.get('delta')}, premium ${rc.get('premium')})"
+           if rc else "\n    ↳ new roll-down contract details unavailable"),
         f"• C — Hold: unrealized P&L ${b.get('Branch_C_Hold', {}).get('unrealized_net_pnl')}",
         f"\nNews: {report.get('sentiment')} — {report.get('rationale','')}",
     ]

@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Set
 
 from app.config import rules as default_rules
 from app.config import settings
@@ -35,11 +35,24 @@ def load_watchlist(path: Optional[Path] = None) -> List[str]:
     return [s.upper() for s in data.get("symbols", [])]
 
 
+def _held_open_symbols() -> Set[str]:
+    """Symbols with an OPEN position — we don't re-screen names we already hold."""
+    from app.memory.decision_store import list_positions
+    return {str(p["symbol"]).upper() for p in list_positions("OPEN")}
+
+
 def build_scout_node(
     client: SchwabClient,
     rules=default_rules,
+    held_symbols_provider: Optional[Callable[[], Set[str]]] = None,
 ) -> Callable[[ScreenerState], dict]:
-    """Return a Scout node bound to a Schwab client + strategy rules."""
+    """Return a Scout node bound to a Schwab client + strategy rules.
+
+    ``held_symbols_provider`` returns the set of symbols to skip because they are
+    already held (defaults to the OPEN positions in the SQL ledger). Injectable
+    for testing.
+    """
+    held_provider = held_symbols_provider or _held_open_symbols
 
     def scout_node(state: ScreenerState) -> dict:
         symbols = state.get("watchlist") or []
@@ -51,9 +64,14 @@ def build_scout_node(
             return {"scout_candidates": [], "errors": ["Scout: empty watchlist."]}
 
         prefiltered = getattr(rules, "watchlist_is_prefiltered", False)
+        try:
+            held = {s.upper() for s in held_provider()}
+        except Exception as exc:  # noqa: BLE001 — never let a memory hiccup crash the screen
+            logger.warning("Scout could not load current holdings (%s); not filtering held names.", exc)
+            held = set()
         logger.info(
-            "Scout screening %d symbols (mode=%s)",
-            len(symbols), "liveness-only" if prefiltered else "full-filter",
+            "Scout screening %d symbols (mode=%s, %d already held → skipped)",
+            len(symbols), "liveness-only" if prefiltered else "full-filter", len(held),
         )
 
         # One chunked, rate-limited quote pass for the whole watchlist.
@@ -64,6 +82,12 @@ def build_scout_node(
             return {"scout_candidates": [], "errors": [f"Scout quote fetch failed: {exc}"]}
 
         for sym in symbols:
+            # Skip names we already hold (an open covered call) — no point
+            # re-recommending one, and it keeps the portfolio diversified.
+            if sym.upper() in held:
+                rejections.append(reject(sym, "SCOUT", "Already held (open position)."))
+                continue
+
             fund = client.extract_fundamentals(quotes, sym)
 
             # Liveness check (always): no live price ⇒ halted/delisted/bad symbol.

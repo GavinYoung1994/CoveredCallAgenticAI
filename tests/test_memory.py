@@ -266,6 +266,12 @@ def test_roll_position_adjusts_cash_keeps_open():
         # Cash = 50000 -10000 +200 -50 +150 = 40300; position stays OPEN.
         assert get_cash_balance(db) == 40_300.0
         assert ds.list_positions("OPEN", db)[0]["position_id"] == "X_1"
+        # Realized P&L on the CLOSED option cycle = original premium 2.00 (+200)
+        # minus buyback 0.50 (-50) = +150; the new 95 call is open (excluded).
+        assert res["total_realized_pnl"] == 150.0
+        from app.memory.positions_store import list_holdings_detailed
+        h = next(x for x in list_holdings_detailed(db_path=db) if x["position_id"] == "X_1")
+        assert h["total_realized_pnl"] == 150.0
     finally:
         os.path.exists(db) and os.unlink(db)
 

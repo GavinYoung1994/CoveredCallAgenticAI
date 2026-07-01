@@ -205,6 +205,30 @@ def _position_realized_pnl(conn: sqlite3.Connection, position_id: str) -> float:
     return round(sum(cash_effect(r[0], r[1], r[2], r[3], r[4] or 0.0) for r in rows), 2)
 
 
+def _realized_option_pnl(conn: sqlite3.Connection, position_id: str) -> float:
+    """Realized P&L on an OPEN (rolled) position = net cash flow of the option
+    legs that are already CLOSED.
+
+    A covered-call roll buys back the current call (BUY_TO_CLOSE) and sells a new
+    one (SELL_TO_OPEN). The stock and the newest short call are still open
+    (unrealized), so realized P&L is every option leg's cash effect MINUS the
+    single still-open short call (the latest SELL_TO_OPEN). This captures the
+    locked-in income from completed roll cycles: premiums collected − buybacks.
+    """
+    option_total = sum(
+        cash_effect(r[0], r[1], r[2], r[3], r[4] or 0.0)
+        for r in conn.execute(
+            "SELECT asset_type, action, quantity, price, fees FROM transactions "
+            "WHERE position_id = ? AND asset_type = 'OPTION'", (position_id,)).fetchall())
+    open_call = conn.execute(
+        "SELECT quantity, price, fees FROM transactions WHERE position_id = ? "
+        "AND asset_type = 'OPTION' AND action = 'SELL_TO_OPEN' "
+        "ORDER BY timestamp DESC, transaction_id DESC LIMIT 1", (position_id,)).fetchone()
+    open_call_cash = cash_effect("OPTION", "SELL_TO_OPEN", open_call[0], open_call[1],
+                                 open_call[2] or 0.0) if open_call else 0.0
+    return round(option_total - open_call_cash, 2)
+
+
 def close_position(
     *,
     position_id: str,
@@ -289,11 +313,18 @@ def roll_position(
                         asset_type="OPTION", action="SELL_TO_OPEN", quantity=contracts,
                         price=new_call_premium, fees=fees, strike_price=new_call_strike,
                         expiration_date=new_call_expiration)
+        # A roll realizes P&L on the closed option legs (premiums collected minus
+        # the buyback). The position stays OPEN, so persist that locked-in income.
+        realized = _realized_option_pnl(conn, position_id)
+        conn.execute("UPDATE positions SET total_realized_pnl = ? WHERE position_id = ?",
+                     (realized, position_id))
         conn.commit()
         net_credit = round((new_call_premium - call_buyback_price) * contracts * 100 - 2 * fees, 2)
-        logger.info("Rolled %s: bought back @ %.2f, sold %.1f call @ %.2f (net credit %+.2f)",
-                    position_id, call_buyback_price, new_call_strike, new_call_premium, net_credit)
-        return {"position_id": position_id, "net_credit": net_credit,
+        logger.info("Rolled %s: bought back @ %.2f, sold %.1f call @ %.2f (net credit %+.2f, "
+                    "realized option P&L $%.2f)",
+                    position_id, call_buyback_price, new_call_strike, new_call_premium,
+                    net_credit, realized)
+        return {"position_id": position_id, "net_credit": net_credit, "total_realized_pnl": realized,
                 "new_strike": new_call_strike, "new_expiration": new_call_expiration}
     finally:
         conn.close()

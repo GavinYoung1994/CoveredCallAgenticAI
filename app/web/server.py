@@ -162,13 +162,35 @@ def launch_workflow(jobs: "Jobs", runners: Dict[str, Callable[[], Any]], name: s
                        f"to watch live progress and logs."}
 
 
+def _live_price_provider(symbols):
+    """Fetch current market prices {symbol: last_price} via Schwab. Best-effort:
+    any failure yields an empty map so the holdings view still renders."""
+    if not symbols:
+        return {}
+    try:
+        from app.data.schwab_client import SchwabClient
+        client = SchwabClient()
+        quotes = client.get_quotes_chunked(list(symbols))
+        out = {}
+        for sym in symbols:
+            px = client.extract_fundamentals(quotes, sym).get("last_price", 0.0)
+            if px and px > 0:
+                out[sym] = px
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("web").warning("Live price lookup failed: %s", exc)
+        return {}
+
+
 def _default_holdings_provider() -> Dict[str, Any]:
-    """Cash + every position with its covered-call contract details (from SQL)."""
+    """Cash + every position with its covered-call contract details (from SQL),
+    enriched with a live current stock price per holding."""
     from app.memory.positions_store import list_holdings_detailed
     from app.memory.account_store import get_cash_balance
     from app.config import settings as _s
     return {"cash_balance": get_cash_balance(_s.sql_db_path),
-            "positions": list_holdings_detailed(db_path=_s.sql_db_path)}
+            "positions": list_holdings_detailed(
+                db_path=_s.sql_db_path, price_provider=_live_price_provider)}
 
 
 def _default_agent_provider(launcher: Optional[Callable[[str], Any]] = None) -> Callable[[], Any]:

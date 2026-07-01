@@ -11,7 +11,7 @@ import logging
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 from app.config import settings
 from app.memory.decision_store import _connect   # ensures schema + column migrations
@@ -80,12 +80,18 @@ def load_open_positions(db_path: Optional[Union[str, Path]] = None) -> List[Open
 
 
 def list_holdings_detailed(status: Optional[str] = None,
-                           db_path: Optional[Union[str, Path]] = None) -> List[dict]:
+                           db_path: Optional[Union[str, Path]] = None,
+                           price_provider: Optional[Callable[[List[str]], dict]] = None) -> List[dict]:
     """Positions enriched with their CURRENT short-call contract for a UI view.
 
     Each row: position_id, symbol, status, dates, shares, stock cost basis,
     realized P&L, downside buffer, plus the latest short call's strike /
     expiration / premium / contracts (JSON-serializable dicts, newest first).
+
+    ``price_provider`` (optional, injectable) maps a list of symbols to their
+    current market price ``{symbol: price}``; when given, each row gets a live
+    ``current_price`` and OPEN positions get an ``unrealized_stock_pnl`` (current
+    vs. cost on the shares). Missing/failed prices leave those fields None.
     """
     conn = _connect(db_path or settings.sql_db_path)   # runs schema + migrations
     conn.row_factory = sqlite3.Row
@@ -94,6 +100,15 @@ def list_holdings_detailed(status: Optional[str] = None,
         args = (status.upper(),) if status else ()
         rows = conn.execute(
             f"SELECT * FROM positions {clause} ORDER BY entry_date DESC", args).fetchall()
+
+        prices: dict = {}
+        if price_provider is not None:
+            symbols = sorted({r["symbol"] for r in rows})
+            try:
+                prices = {k.upper(): v for k, v in (price_provider(symbols) or {}).items()}
+            except Exception as exc:  # noqa: BLE001 — live price is a nice-to-have, never fatal
+                logger.warning("Holdings price lookup failed: %s", exc)
+
         out: List[dict] = []
         for r in rows:
             pid = r["position_id"]
@@ -111,6 +126,13 @@ def list_holdings_detailed(status: Optional[str] = None,
                 realized_pnl=r["total_realized_pnl"], premium=premium, contracts=contracts,
                 entry_date=r["entry_date"], close_date=r["close_date"],
                 expiration=call["expiration_date"] if call else None)
+
+            cur = prices.get(str(r["symbol"]).upper())
+            cur = float(cur) if cur not in (None, "", 0) else None
+            unrealized = None
+            if cur is not None and r["status"] == "OPEN" and r["stock_purchase_price"] and shares:
+                unrealized = round((cur - float(r["stock_purchase_price"])) * shares, 2)
+
             out.append({
                 "position_id": pid,
                 "symbol": r["symbol"],
@@ -119,6 +141,8 @@ def list_holdings_detailed(status: Optional[str] = None,
                 "close_date": r["close_date"],
                 "shares": shares,
                 "stock_purchase_price": r["stock_purchase_price"],
+                "current_price": round(cur, 2) if cur is not None else None,
+                "unrealized_stock_pnl": unrealized,
                 "total_realized_pnl": r["total_realized_pnl"],
                 "downside_buffer_percent": r["downside_buffer_percent"],
                 "short_call_strike": call["strike_price"] if call else None,

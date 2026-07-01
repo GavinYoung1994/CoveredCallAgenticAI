@@ -64,6 +64,9 @@ def format_recommendations(
             f"**{i}. {rec['symbol']}  —  Grade {rec.get('grade', '?')} "
             f"(score {rec.get('score', 0):.0f})**"
         )
+        px = rec.get("underlying_price")
+        if px:
+            lines.append(f"• Current stock price: ${px:,.2f}")
         strike = c.get("strike")
         exp = str(c.get("expiration_key", "")).split(":")[0]
         dte = c.get("days_to_expiration")

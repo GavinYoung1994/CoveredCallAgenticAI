@@ -24,28 +24,61 @@ logger = logging.getLogger("node.risk")
 
 _RATIONALE_SYSTEM = (
     "You are a portfolio risk manager presenting a covered-call trade to a human "
-    "for approval. In 2-3 plain sentences, justify the trade using the provided "
-    "numbers (annualized yield, downside buffer, IV richness, sentiment, "
-    "probability of keeping the premium). Be balanced — mention the main risk. "
-    "Do NOT invent numbers; use only what is given."
+    "for approval. Write 3-4 plain, specific sentences that cover, in order:\n"
+    "1. TECHNICALS — explain WHY the chart favors selling a covered call, citing "
+    "the concrete indicators given (the detected trend and 50-day SMA slope, the "
+    "RSI level and what it says about being over/under-bought, where price sits "
+    "relative to the Bollinger bands and its moving averages, and whether "
+    "volatility is contracting). Name the actual numbers.\n"
+    "2. NEWS — summarize what the recent news says and why the sentiment is "
+    "neutral-to-positive (i.e. no severe negative overhang), referencing the "
+    "news finding provided.\n"
+    "3. INCOME & RISK — the annualized yield, downside buffer, IV richness, and "
+    "probability of keeping the premium; then name the single biggest risk.\n"
+    "Use ONLY the numbers and text provided — do NOT invent data."
 )
 
 
+def _fmt_technicals(snapshot: Dict[str, Any], trend: Dict[str, Any]) -> str:
+    """Render the Quant technical indicators as a compact briefing for the LLM."""
+    price = snapshot.get("price")
+    sma20, sma50, sma200 = snapshot.get("SMA_20"), snapshot.get("SMA_50"), snapshot.get("SMA_200")
+    bb_up, bb_lo = snapshot.get("Bollinger_Upper"), snapshot.get("Bollinger_Lower")
+    parts = [
+        f"detected trend: {trend.get('detected_trend', 'n/a')} "
+        f"(50-day SMA slope {trend.get('sma_50_slope_percent', 0):+.1f}% over "
+        f"{trend.get('lookback_period_days', '?')}d)",
+        f"RSI(14): {snapshot.get('RSI_14', 'n/a')}",
+        f"price: {price}, SMA20: {sma20}, SMA50: {sma50}"
+        + (f", SMA200: {sma200}" if sma200 is not None else ""),
+        f"Bollinger band: {bb_lo} — {bb_up}",
+        "volatility " + ("contracting (Bollinger squeeze)" if trend.get("is_volatility_contracting")
+                         else "not contracting"),
+    ]
+    return "; ".join(parts)
+
+
 def _llm_rationale(llm: LocalLLM, rec_data: Dict[str, Any]) -> str:
+    news_line = rec_data.get("news_rationale") or "No notable news."
+    headlines = rec_data.get("news_titles") or []
+    headline_line = ("\n  Recent headlines: " + " | ".join(headlines[:3])) if headlines else ""
     user = (
         f"Symbol {rec_data['symbol']}: sell the {rec_data['strike']} call expiring "
-        f"{rec_data['expiration']} ({rec_data['dte']} days, delta {rec_data['delta']:.2f}). "
-        f"Annualized yield {rec_data['annualized_yield']:.1f}%, downside buffer "
+        f"{rec_data['expiration']} ({rec_data['dte']} days, delta {rec_data['delta']:.2f}).\n"
+        f"TECHNICALS — {rec_data['technicals']}\n"
+        f"NEWS — sentiment {rec_data['sentiment']}; analyst finding: {news_line}{headline_line}\n"
+        f"INCOME — annualized yield {rec_data['annualized_yield']:.1f}%, downside buffer "
         f"{rec_data['buffer']:.1f}%, IV/HV richness {rec_data['iv_ratio']:.2f}x, "
-        f"sentiment {rec_data['sentiment']}, probability of keeping premium "
-        f"{rec_data['prob_keep']:.0f}%. Composite grade {rec_data['grade']}."
+        f"probability of keeping premium {rec_data['prob_keep']:.0f}%. Composite grade "
+        f"{rec_data['grade']}."
     )
     try:
-        return llm.chat(_RATIONALE_SYSTEM, user, max_tokens=200).strip()
+        return llm.chat(_RATIONALE_SYSTEM, user, max_tokens=320).strip()
     except Exception as exc:  # noqa: BLE001 — prose is non-critical; never crash the run
         logger.warning("Rationale LLM failed for %s: %s", rec_data["symbol"], exc)
         return (f"Grade {rec_data['grade']}: {rec_data['annualized_yield']:.1f}% annualized, "
-                f"{rec_data['buffer']:.1f}% buffer, sentiment {rec_data['sentiment']}.")
+                f"{rec_data['buffer']:.1f}% buffer, sentiment {rec_data['sentiment']}. "
+                f"Technicals — {rec_data['technicals']}.")
 
 
 def _target_yield(ym: Dict[str, Any], rules) -> float:
@@ -70,15 +103,20 @@ def _build_recommendation(
     scoring = eng.score_covered_call_candidate(
         target, iv_ratio, report["sentiment_score"], buffer, prob_keep, rules.score_weights)
     grade = eng.grade_from_score(scoring["score"], rules.grade_thresholds)
+    technicals = _fmt_technicals(c.get("snapshot", {}), c.get("trend", {}))
+    news_titles = [s.get("title") for s in (report.get("sources") or []) if s.get("title")]
     rationale = _llm_rationale(llm, {
         "symbol": c["symbol"], "strike": contract.get("strike"),
         "expiration": str(contract.get("expiration_key", "")).split(":")[0],
         "dte": contract.get("days_to_expiration"), "delta": contract.get("delta", 0.0),
         "annualized_yield": target, "buffer": buffer, "iv_ratio": iv_ratio,
         "sentiment": report["sentiment"], "prob_keep": prob_keep, "grade": grade,
+        "technicals": technicals, "news_rationale": report.get("rationale", ""),
+        "news_titles": news_titles,
     })
     rec: Recommendation = {
         "symbol": c["symbol"], "grade": grade, "score": scoring["score"],
+        "underlying_price": round(float(c.get("underlying_price", 0.0) or 0.0), 2),
         "annualized_yield_percent": round(target, 2), "contract": contract, "yield_metrics": ym,
         "sentiment": report["sentiment"], "iv_to_hv_ratio": round(iv_ratio, 2),
         "prob_keep_premium_percent": round(prob_keep, 1),
