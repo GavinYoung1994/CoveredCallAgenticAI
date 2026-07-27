@@ -186,6 +186,9 @@ def open_position(
             price=call_premium, fees=fees, strike_price=call_strike,
             expiration_date=call_expiration,
         )
+        # The premium is realized income immediately (cash in hand).
+        conn.execute("UPDATE positions SET total_realized_pnl = ? WHERE position_id = ?",
+                     (_realized_option_pnl(conn, position_id), position_id))
         conn.commit()
         logger.info("Opened position %s: %d sh %s @ %.2f, sold %d call(s) @ %.2f "
                     "(net cash %+.2f)", position_id, shares, symbol, stock_purchase_price,
@@ -206,27 +209,74 @@ def _position_realized_pnl(conn: sqlite3.Connection, position_id: str) -> float:
 
 
 def _realized_option_pnl(conn: sqlite3.Connection, position_id: str) -> float:
-    """Realized P&L on an OPEN (rolled) position = net cash flow of the option
-    legs that are already CLOSED.
+    """Realized option P&L = net cash flow of ALL of a position's option legs
+    (premiums collected − any buybacks).
 
-    A covered-call roll buys back the current call (BUY_TO_CLOSE) and sells a new
-    one (SELL_TO_OPEN). The stock and the newest short call are still open
-    (unrealized), so realized P&L is every option leg's cash effect MINUS the
-    single still-open short call (the latest SELL_TO_OPEN). This captures the
-    locked-in income from completed roll cycles: premiums collected − buybacks.
+    Option premium is realized income the moment the call is sold: the cash is
+    received immediately and is never clawed back, whether the call later expires
+    worthless, is assigned, or is rolled. So every SELL_TO_OPEN premium counts as
+    realized right away; a later BUY_TO_CLOSE (roll/defense) is a realized cost
+    that nets against it. The STOCK leg is NOT included here — a stock gain/loss
+    is only realized once the shares are actually sold (see close_position).
     """
-    option_total = sum(
-        cash_effect(r[0], r[1], r[2], r[3], r[4] or 0.0)
-        for r in conn.execute(
-            "SELECT asset_type, action, quantity, price, fees FROM transactions "
-            "WHERE position_id = ? AND asset_type = 'OPTION'", (position_id,)).fetchall())
-    open_call = conn.execute(
-        "SELECT quantity, price, fees FROM transactions WHERE position_id = ? "
-        "AND asset_type = 'OPTION' AND action = 'SELL_TO_OPEN' "
-        "ORDER BY timestamp DESC, transaction_id DESC LIMIT 1", (position_id,)).fetchone()
-    open_call_cash = cash_effect("OPTION", "SELL_TO_OPEN", open_call[0], open_call[1],
-                                 open_call[2] or 0.0) if open_call else 0.0
-    return round(option_total - open_call_cash, 2)
+    rows = conn.execute(
+        "SELECT action, quantity, price, fees FROM transactions "
+        "WHERE position_id = ? AND asset_type = 'OPTION'", (position_id,)).fetchall()
+    return round(sum(cash_effect("OPTION", r[0], r[1], r[2], r[3] or 0.0) for r in rows), 2)
+
+
+def expire_option(
+    *,
+    position_id: str,
+    contracts: Optional[int] = None,
+    fees: float = 0.0,
+    db_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    """Record that the short call EXPIRED WORTHLESS — the seller keeps the full
+    premium and RETAINS the shares (no stock sale).
+
+    This books a BUY_TO_CLOSE of the call at $0 (so the premium becomes realized
+    and there is no open obligation) but does NOT touch the stock leg: the
+    position stays OPEN with its 100 shares intact. Only an explicit ASSIGNED or
+    LIQUIDATED sells the stock. Returns the realized premium.
+    """
+    conn = _connect(db_path or settings.sql_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT status FROM positions WHERE position_id = ?",
+                           (position_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"Position {position_id} not found.")
+        # Size the expiration to the currently-open short call.
+        open_call = conn.execute(
+            "SELECT quantity FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
+            "AND action = 'SELL_TO_OPEN' ORDER BY timestamp DESC, transaction_id DESC LIMIT 1",
+            (position_id,)).fetchone()
+        qty = int(contracts or (open_call["quantity"] if open_call else 1) or 1)
+        seq = conn.execute("SELECT COUNT(*) FROM transactions WHERE position_id = ?",
+                           (position_id,)).fetchone()[0]
+        # BUY_TO_CLOSE @ $0 → premium fully realized, no cash movement, shares kept.
+        add_transaction(conn, transaction_id=f"{position_id}_EXP{seq}", position_id=position_id,
+                        asset_type="OPTION", action="BUY_TO_CLOSE", quantity=qty,
+                        price=0.0, fees=fees)
+        realized = _realized_option_pnl(conn, position_id)
+        # Stays OPEN — the stock is still held; only the option obligation ended.
+        conn.execute("UPDATE positions SET total_realized_pnl = ? WHERE position_id = ?",
+                     (realized, position_id))
+        conn.commit()
+        logger.info("Option expired worthless on %s: premium realized $%.2f, %d shares retained "
+                    "(position stays OPEN).", position_id, realized, _stock_shares(conn, position_id))
+        return {"position_id": position_id, "status": "OPEN", "shares_retained": True,
+                "total_realized_pnl": realized, "action": "OPTION_EXPIRED"}
+    finally:
+        conn.close()
+
+
+def _stock_shares(conn: sqlite3.Connection, position_id: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(SUM(quantity), 0) FROM transactions WHERE position_id = ? "
+        "AND asset_type = 'STOCK' AND action = 'BUY_TO_OPEN'", (position_id,)).fetchone()
+    return int(row[0] or 0)
 
 
 def close_position(

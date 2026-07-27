@@ -266,12 +266,70 @@ def test_roll_position_adjusts_cash_keeps_open():
         # Cash = 50000 -10000 +200 -50 +150 = 40300; position stays OPEN.
         assert get_cash_balance(db) == 40_300.0
         assert ds.list_positions("OPEN", db)[0]["position_id"] == "X_1"
-        # Realized P&L on the CLOSED option cycle = original premium 2.00 (+200)
-        # minus buyback 0.50 (-50) = +150; the new 95 call is open (excluded).
-        assert res["total_realized_pnl"] == 150.0
+        # Premiums are realized immediately: orig +200, buyback -50, new +150 = +300.
+        assert res["total_realized_pnl"] == 300.0
         from app.memory.positions_store import list_holdings_detailed
         h = next(x for x in list_holdings_detailed(db_path=db) if x["position_id"] == "X_1")
-        assert h["total_realized_pnl"] == 150.0
+        assert h["total_realized_pnl"] == 300.0
+    finally:
+        os.path.exists(db) and os.unlink(db)
+
+
+def test_open_position_realizes_premium_immediately():
+    db = _tmp_db()
+    try:
+        from app.memory.positions_store import list_holdings_detailed
+        ds.open_position(position_id="P_1", symbol="P", stock_purchase_price=50.0, shares=100,
+                         call_strike=55.0, call_premium=1.25, call_expiration="2026-08-21", db_path=db)
+        h = next(x for x in list_holdings_detailed(db_path=db) if x["position_id"] == "P_1")
+        # Premium 1.25 * 100 = 125 realized the moment the call is sold.
+        assert h["total_realized_pnl"] == 125.0
+        assert h["status"] == "OPEN" and h["has_active_call"] is True
+    finally:
+        os.path.exists(db) and os.unlink(db)
+
+
+def test_expire_option_keeps_shares_realizes_premium():
+    db = _tmp_db()
+    try:
+        from app.memory.account_store import get_cash_balance, set_cash_balance
+        from app.memory.positions_store import list_holdings_detailed
+        set_cash_balance(50_000.0, db)
+        ds.open_position(position_id="X_1", symbol="X", stock_purchase_price=100.0, shares=100,
+                         call_strike=105.0, call_premium=2.0, call_expiration="2026-07-28", db_path=db)
+        cash_after_open = get_cash_balance(db)   # 50000 - 10000 + 200 = 40200
+        assert cash_after_open == 40_200.0
+
+        res = ds.expire_option(position_id="X_1", db_path=db)
+        # The call expired worthless: no cash movement, shares retained, stays OPEN.
+        assert res["status"] == "OPEN" and res["shares_retained"] is True
+        assert get_cash_balance(db) == cash_after_open        # unchanged
+        assert res["total_realized_pnl"] == 200.0             # full premium now realized
+
+        h = next(x for x in list_holdings_detailed(db_path=db) if x["position_id"] == "X_1")
+        assert h["status"] == "OPEN"
+        assert h["shares"] == 100                              # still hold the stock
+        assert h["has_active_call"] is False                  # no covered call anymore
+        assert h["short_call_strike"] is None
+        assert h["total_realized_pnl"] == 200.0
+    finally:
+        os.path.exists(db) and os.unlink(db)
+
+
+def test_expired_via_management_service_does_not_sell_stock():
+    db = _tmp_db()
+    try:
+        from app.manage import ManagementService
+        ds.open_position(position_id="H_1", symbol="HOOD", stock_purchase_price=80.0, shares=100,
+                         call_strike=85.0, call_premium=3.0, call_expiration="2026-07-17", db_path=db)
+        svc = ManagementService(db_path=db, memory=None)
+        # Even if a (wrong) stock_sale_price is passed, EXPIRED must NOT sell stock.
+        out = svc.update_holding_status(status="EXPIRED", symbol="HOOD", stock_sale_price=60.0)
+        assert out["status"] == "OPEN" and out["shares_retained"] is True
+        assert out["total_realized_pnl"] == 300.0             # premium 3.00 * 100
+        from app.memory.positions_store import list_holdings_detailed
+        h = next(x for x in list_holdings_detailed(db_path=db) if x["symbol"] == "HOOD")
+        assert h["shares"] == 100 and h["status"] == "OPEN"
     finally:
         os.path.exists(db) and os.unlink(db)
 

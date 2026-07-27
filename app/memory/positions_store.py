@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Union
 
 from app.config import settings
-from app.memory.decision_store import _connect   # ensures schema + column migrations
+from app.memory.decision_store import _connect, _realized_option_pnl  # schema + realized-P&L helper
 from app.state import OpenPosition
 
 logger = logging.getLogger("positions-store")
@@ -45,6 +45,18 @@ def load_open_positions(db_path: Optional[Union[str, Path]] = None) -> List[Open
             ).fetchone()
             if not call or call["strike_price"] is None:
                 logger.warning("Skipping %s: no opening short-call leg found.", pid)
+                continue
+            # Skip if the short call is no longer active (expired/closed): there is
+            # no covered call to defend, only shares held.
+            n_sto = int(conn.execute(
+                "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
+                "AND action = 'SELL_TO_OPEN'", (pid,)).fetchone()[0] or 0)
+            n_btc = int(conn.execute(
+                "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
+                "AND action = 'BUY_TO_CLOSE'", (pid,)).fetchone()[0] or 0)
+            if n_sto <= n_btc:
+                logger.info("Skipping %s in defense scan: call expired/closed, no covered call to defend "
+                            "(shares still held).", pid)
                 continue
 
             shares_row = conn.execute(
@@ -116,6 +128,17 @@ def list_holdings_detailed(status: Optional[str] = None,
                 "SELECT strike_price, expiration_date, price, quantity FROM transactions "
                 "WHERE position_id = ? AND asset_type = 'OPTION' AND action = 'SELL_TO_OPEN' "
                 "ORDER BY timestamp DESC, transaction_id DESC LIMIT 1", (pid,)).fetchone()
+            # Is that short call still active, or has it been closed (rolled away /
+            # expired)? # open calls = # SELL_TO_OPEN − # BUY_TO_CLOSE.
+            n_sto = int(conn.execute(
+                "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
+                "AND action = 'SELL_TO_OPEN'", (pid,)).fetchone()[0] or 0)
+            n_btc = int(conn.execute(
+                "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
+                "AND action = 'BUY_TO_CLOSE'", (pid,)).fetchone()[0] or 0)
+            has_active_call = n_sto > n_btc
+            if not has_active_call:
+                call = None  # call expired/closed — shares still held, no covered call
             shares = int(conn.execute(
                 "SELECT COALESCE(SUM(quantity), 0) FROM transactions WHERE position_id = ? "
                 "AND asset_type = 'STOCK' AND action = 'BUY_TO_OPEN'", (pid,)).fetchone()[0] or 0)
@@ -133,6 +156,13 @@ def list_holdings_detailed(status: Optional[str] = None,
             if cur is not None and r["status"] == "OPEN" and r["stock_purchase_price"] and shares:
                 unrealized = round((cur - float(r["stock_purchase_price"])) * shares, 2)
 
+            # Realized P&L: for OPEN positions this is the option premium income
+            # (realized the moment collected); computed live so it's correct even
+            # for positions opened before premiums were booked as realized. For
+            # closed positions the stored value already includes the stock leg.
+            realized_pnl = (_realized_option_pnl(conn, pid) if r["status"] == "OPEN"
+                            else r["total_realized_pnl"])
+
             out.append({
                 "position_id": pid,
                 "symbol": r["symbol"],
@@ -143,12 +173,13 @@ def list_holdings_detailed(status: Optional[str] = None,
                 "stock_purchase_price": r["stock_purchase_price"],
                 "current_price": round(cur, 2) if cur is not None else None,
                 "unrealized_stock_pnl": unrealized,
-                "total_realized_pnl": r["total_realized_pnl"],
+                "total_realized_pnl": realized_pnl,
                 "downside_buffer_percent": r["downside_buffer_percent"],
                 "short_call_strike": call["strike_price"] if call else None,
                 "short_call_expiration": call["expiration_date"] if call else None,
                 "short_call_premium": premium,
                 "contracts": contracts,
+                "has_active_call": has_active_call,
                 "return_percent": ret_pct,
                 "annualized_return_percent": ann_pct,
                 "days_held": days,

@@ -117,6 +117,23 @@ def test_tot_branches():
     assert r["Branch_B_Roll_Down"]["net_credit_received"] == 100.0
     assert r["Branch_B_Roll_Down"]["is_valid"] is True
     assert r["Branch_C_Hold"]["unrealized_net_pnl"] == -850.0
+    # No new_call_strike → no assignment-scenario fields.
+    assert "net_pnl_if_assigned_at_new_strike" not in r["Branch_B_Roll_Down"]
+
+
+def test_tot_branch_b_assignment_loss_below_basis():
+    # Entry $100, now $90, collected $2, buy-back $0.50, roll for $1.50 into a
+    # NEW $95 strike — below the $100 cost basis.
+    r = e.generate_tot_defense_branches(100.0, 90.0, 2.0, 0.50, 1.50, new_call_strike=95.0)
+    b = r["Branch_B_Roll_Down"]
+    assert b["new_call_strike"] == 95.0
+    assert b["new_strike_below_cost_basis"] is True
+    # Stock if assigned at 95: (95-100)*100 = -500.
+    assert b["stock_loss_if_assigned_at_new_strike"] == -500.0
+    # Premiums: (2.0 - 0.50 + 1.50)*100 = 300.
+    assert b["total_premiums_collected"] == 300.0
+    # Net if called away at 95: -500 + 300 = -200 (a real locked-in loss).
+    assert b["net_pnl_if_assigned_at_new_strike"] == -200.0
 
 
 def test_score_and_grade():

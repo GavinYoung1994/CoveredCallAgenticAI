@@ -26,7 +26,8 @@ from typing import Any, Callable, Dict, List, Optional
 from app.config import settings
 from app.llm import LocalLLM
 from app.memory.account_store import get_cash_balance, set_cash_balance
-from app.memory.decision_store import close_position, list_positions, set_position_status
+from app.memory.decision_store import (
+    close_position, expire_option, list_positions, set_position_status)
 from app.memory.positions_store import list_holdings_detailed
 
 logger = logging.getLogger("manage")
@@ -75,18 +76,28 @@ class ManagementService:
         contracts: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Record an executed/closed trade for a holding (identify it by symbol OR
-        position_id). For a closing status (ASSIGNED/LIQUIDATED/EXPIRED) this records
-        the closing legs, adjusts cash, and computes realized P&L.
+        position_id). Records the closing legs, adjusts cash, computes realized P&L.
 
-        Smart defaults: for ASSIGNED (called away), the stock sale price defaults to
-        the short-call strike and the call buyback to $0 (the call was exercised), so
-        you don't need to supply fills. LIQUIDATED needs a stock_sale_price."""
+        Status meanings (IMPORTANT — they differ on whether the STOCK is sold):
+          * EXPIRED   — the CALL expired worthless. Keep the full premium as a
+            realized gain and RETAIN the shares. NO stock is sold; the position
+            stays OPEN with its 100 shares. (Any stock_sale_price is ignored.)
+          * ASSIGNED  — the call was exercised; shares are called away AT THE
+            STRIKE. Defaults: stock sale = strike, buyback = $0.
+          * LIQUIDATED — you sold the shares on the open market; needs a positive
+            stock_sale_price.
+        Only ASSIGNED and LIQUIDATED sell the stock."""
         status = status.upper()
         pos = self._resolve_position(position_id, symbol)
         if pos is None:
             return {"error": f"No holding found for {position_id or symbol!r}."}
         pid = pos["position_id"]
         contracts = contracts or pos.get("contracts") or 1
+
+        # EXPIRED = the CALL expired worthless. Keep the premium as realized gain,
+        # RETAIN the shares — never sell stock here. Only ASSIGNED/LIQUIDATED sell.
+        if status == "EXPIRED":
+            return expire_option(position_id=pid, contracts=contracts, db_path=self.db_path)
 
         if status in _CLOSING_STATUSES:
             if status == "ASSIGNED":   # called away at the strike; call exercised (no buyback)

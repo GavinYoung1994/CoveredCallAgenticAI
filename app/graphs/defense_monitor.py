@@ -17,9 +17,12 @@ from typing import Any, Dict, Optional
 from langgraph.graph import END, START, StateGraph
 
 from app.config import rules as default_rules
+from app.config import settings
 from app.logging_config import setup_logging
 from app.data.news_client import NewsClient
 from app.data.schwab_client import SchwabClient
+from app.data.earnings_client import EarningsClient
+from app.data.earnings_search import EarningsSearchClient, CompositeEarningsClient
 from app.llm import LocalLLM, get_llm
 from app.nodes.defense import (
     build_defense_quant_node,
@@ -37,17 +40,32 @@ def _route_after_quant(state: DefenseState) -> str:
     return "news" if state.get("breach_detected") else "end"
 
 
+def _default_earnings_client(llm: LocalLLM):
+    """Composite next-earnings provider (Finnhub → Google+LLM search), same as
+    the entry screener uses. Best-effort; the roll guardrail degrades to no cap."""
+    providers = [EarningsClient()]
+    if settings.earnings_search_enabled:
+        providers.append(EarningsSearchClient(llm=llm))
+    return CompositeEarningsClient(providers)
+
+
 def build_defense_monitor_graph(
     *,
     schwab_client: SchwabClient,
     news_client: NewsClient,
     llm: LocalLLM,
+    earnings_client=None,
     notifier: Optional[DiscordNotifier] = None,
     rules=default_rules,
     today: Optional[date] = None,
 ):
+    # Lazy: only build the (network) earnings client if a breach actually needs a
+    # roll contract — keeps graph construction side-effect-free (offline tests).
+    earnings_provider = ((lambda: earnings_client) if earnings_client is not None
+                         else (lambda: _default_earnings_client(llm)))
     graph = StateGraph(DefenseState)
-    graph.add_node("quant", build_defense_quant_node(schwab_client, rules=rules, today=today))
+    graph.add_node("quant", build_defense_quant_node(
+        schwab_client, earnings_provider=earnings_provider, rules=rules, today=today))
     graph.add_node("news", build_defense_news_node(news_client, llm, rules=rules))
     graph.add_node("risk", build_defense_risk_node(llm, notifier=notifier, rules=rules))
 
@@ -69,6 +87,7 @@ def run_defense_monitor(
     schwab_client: Optional[SchwabClient] = None,
     news_client: Optional[NewsClient] = None,
     llm: Optional[LocalLLM] = None,
+    earnings_client=None,
     notifier: Optional[DiscordNotifier] = None,
     run_id: Optional[str] = None,
     run_timestamp: Optional[str] = None,
@@ -89,7 +108,7 @@ def run_defense_monitor(
 
     app = build_defense_monitor_graph(
         schwab_client=schwab_client, news_client=news_client, llm=llm,
-        notifier=notifier, rules=rules, today=today)
+        earnings_client=earnings_client, notifier=notifier, rules=rules, today=today)
 
     state: DefenseState = {
         "run_id": run_id,
@@ -119,6 +138,7 @@ def run_defense_scan(
     schwab_client: Optional[SchwabClient] = None,
     news_client: Optional[NewsClient] = None,
     llm: Optional[LocalLLM] = None,
+    earnings_client=None,
     notifier: Optional[DiscordNotifier] = None,
     run_timestamp: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -145,7 +165,7 @@ def run_defense_scan(
 
     app = build_defense_monitor_graph(
         schwab_client=schwab_client, news_client=news_client, llm=llm,
-        notifier=notifier, rules=rules, today=today)
+        earnings_client=earnings_client, notifier=notifier, rules=rules, today=today)
 
     results, breached = [], []
     logger.info("Defense scan: evaluating %d open position(s).", len(positions))

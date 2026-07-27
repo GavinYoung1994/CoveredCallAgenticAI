@@ -17,7 +17,7 @@ human via Discord — execution stays human-only.
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.config import rules as default_rules
@@ -104,17 +104,44 @@ def _roll_contract_details(best: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _earnings_capped_max_dte(rules, earnings_date, run_today: date) -> Tuple[int, Optional[str]]:
+    """Cap the roll-down max DTE so the new call expires BEFORE the next earnings
+    date (the same guardrail entry uses). Returns (max_dte, note_or_None)."""
+    default_max = rules.max_days_to_expiration
+    ed = eng._coerce_date(earnings_date) if earnings_date else None
+    if ed is None:
+        return default_max, None
+    days_to_earnings = (ed - run_today).days
+    # Expire strictly before earnings.
+    capped = min(default_max, days_to_earnings - 1)
+    if capped < default_max:
+        return capped, (f"Roll capped to expire before earnings on {ed.isoformat()} "
+                        f"({days_to_earnings}d out).")
+    return default_max, None
+
+
 def _resolve_branch_inputs(
-    client: SchwabClient, state: DefenseState, pos: Dict[str, Any], rules
-) -> Tuple[float, float, Optional[Dict[str, Any]], Optional[str]]:
+    client: SchwabClient, state: DefenseState, pos: Dict[str, Any], rules,
+    *, earnings_date=None, run_today: Optional[date] = None,
+) -> Tuple[float, float, Optional[Dict[str, Any]], List[str], Optional[str]]:
     """Resolve the two option inputs the branch P&L needs — the current short-call
     ask (to buy it back) and a roll-down premium — from state or the chain, plus
     the details of the proposed roll-down contract (strike/expiration/DTE).
-    Returns (current_call_ask, roll_down_premium, roll_contract, error_or_None)."""
+
+    The roll-down contract's expiration is constrained to fall BEFORE the next
+    earnings date (earnings guardrail). Returns
+    (current_call_ask, roll_down_premium, roll_contract, notes, error_or_None)."""
     current_call_ask = state.get("current_call_ask")
     roll_premium = state.get("roll_down_premium")
     roll_contract: Optional[Dict[str, Any]] = None
+    notes: List[str] = []
     err = None
+    run_today = run_today or date.today()
+
+    max_dte, cap_note = _earnings_capped_max_dte(rules, earnings_date, run_today)
+    if cap_note:
+        notes.append(cap_note)
+
     if current_call_ask is None or roll_premium is None:
         try:
             chain = client.get_option_chain(pos["symbol"], contract_type="CALL", range_filter="ALL")
@@ -123,28 +150,61 @@ def _resolve_branch_inputs(
         if current_call_ask is None:
             current_call_ask = _find_call_ask_by_strike(
                 chain, pos.get("short_call_strike", 0.0), pos.get("short_call_expiration"))
-        # Always identify the best roll-down candidate for its contract details,
-        # even when the premium was injected via state.
-        best = eng.find_optimal_covered_call(
-            chain, target_delta=rules.target_delta, delta_band=rules.delta_band,
-            min_dte=rules.min_days_to_expiration, max_dte=rules.max_days_to_expiration)
-        roll_contract = _roll_contract_details(best)
-        if roll_premium is None:
-            roll_premium = best.get("mark", 0.0) if "error" not in best else 0.0
-    return float(current_call_ask or 0.0), float(roll_premium or 0.0), roll_contract, err
+        if max_dte < rules.min_days_to_expiration:
+            # Earnings is so close no safe roll expiration exists.
+            notes.append(f"No roll-down contract fits before earnings (need ≥{rules.min_days_to_expiration}d, "
+                         f"only {max_dte}d available).")
+        else:
+            # Always identify the best roll-down candidate for its contract
+            # details, even when the premium was injected via state.
+            best = eng.find_optimal_covered_call(
+                chain, target_delta=rules.target_delta, delta_band=rules.delta_band,
+                min_dte=rules.min_days_to_expiration, max_dte=max_dte)
+            roll_contract = _roll_contract_details(best)
+            if roll_premium is None:
+                roll_premium = best.get("mark", 0.0) if "error" not in best else 0.0
+    return (float(current_call_ask or 0.0), float(roll_premium or 0.0), roll_contract, notes, err)
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  Defense Quant — generate the three branches with exact P&L
 # ══════════════════════════════════════════════════════════════════════
+def _lookup_next_earnings(earnings_client, sym: str, run_today: date) -> Tuple[Optional[str], Optional[str]]:
+    """Best-effort next-earnings-date lookup. Returns (date_or_None, error_or_None)."""
+    if earnings_client is None:
+        return None, None
+    try:
+        to_d = (run_today + timedelta(days=120)).isoformat()
+        return earnings_client.get_next_earnings_date(sym, run_today.isoformat(), to_d), None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Defense earnings lookup failed for {sym}: {exc}"
+
+
 def build_defense_quant_node(
-    client: SchwabClient, rules=default_rules, today: Optional[date] = None
+    client: SchwabClient, earnings_provider: Optional[Callable[[], Any]] = None,
+    rules=default_rules, today: Optional[date] = None,
 ) -> Callable[[DefenseState], dict]:
+    """``earnings_provider`` is a zero-arg callable returning an earnings client
+    (or None). It's invoked lazily — only when a breach needs a roll contract —
+    so the (network) client isn't constructed on every graph build."""
+    _cache: Dict[str, Any] = {}
+
+    def _earnings_client():
+        if earnings_provider is None:
+            return None
+        if "client" not in _cache:
+            try:
+                _cache["client"] = earnings_provider()
+            except Exception as exc:  # noqa: BLE001 — a failed client just means no earnings cap
+                logger.warning("Could not build earnings client (%s); roll will not be earnings-capped.", exc)
+                _cache["client"] = None
+        return _cache["client"]
 
     def node(state: DefenseState) -> dict:
         pos = state["position"]
         sym = pos["symbol"]
         errors: List[str] = []
+        run_today = today or date.today()
 
         price, price_err = _resolve_current_price(client, state, sym)
         if price_err:
@@ -166,23 +226,41 @@ def build_defense_quant_node(
         logger.info("Defense: %s BREACH — down %.1f%% exceeds the %.1f%% downside cushion; "
                     "generating ToT branches.", sym, abs(drop_pct), abs(threshold))
 
-        current_call_ask, roll_premium, roll_contract, chain_err = _resolve_branch_inputs(
-            client, state, pos, rules)
+        # Earnings guardrail: the roll-down contract must expire before the next
+        # earnings report (same rule the entry screener enforces). Only look it up
+        # when we actually need to pick a roll contract from the chain (i.e. the
+        # roll inputs weren't pre-supplied) — avoids a needless earnings API call.
+        need_chain = state.get("current_call_ask") is None or state.get("roll_down_premium") is None
+        earnings_date, earn_err = (None, None)
+        if need_chain:
+            earnings_date, earn_err = _lookup_next_earnings(_earnings_client(), sym, run_today)
+        if earn_err:
+            errors.append(earn_err)
+
+        current_call_ask, roll_premium, roll_contract, roll_notes, chain_err = _resolve_branch_inputs(
+            client, state, pos, rules, earnings_date=earnings_date, run_today=run_today)
         if chain_err:
             errors.append(chain_err)
+        for n in roll_notes:
+            logger.info("Defense roll (%s): %s", sym, n)
 
         # Loss is computed against the RAW cost basis (entry stock price), NOT an
         # adjusted basis — generate_tot_defense_branches uses entry_stock_price
         # directly, so the stock loss reflects the true drop from purchase price.
+        # new_call_strike lets Branch B report the loss locked in if assigned at
+        # a strike below the cost basis.
+        new_strike = roll_contract.get("strike") if roll_contract else None
         branches = eng.generate_tot_defense_branches(
             entry_stock_price=entry, current_stock_price=price,
             original_premium=float(pos.get("original_premium", 0.0)),
-            current_call_ask=current_call_ask, roll_down_premium=roll_premium)
+            current_call_ask=current_call_ask, roll_down_premium=roll_premium,
+            new_call_strike=new_strike)
 
         branch_analysis = {
             "drop_percent": round(drop_pct, 2), "current_stock_price": price,
             "raw_cost_basis": entry, "current_call_ask": current_call_ask,
             "roll_down_premium": roll_premium, "roll_down_contract": roll_contract,
+            "next_earnings_date": earnings_date, "roll_notes": roll_notes,
             "existing_short_call": {
                 "strike": pos.get("short_call_strike"),
                 "expiration": pos.get("short_call_expiration"),
@@ -249,7 +327,12 @@ _DECIDE_SYSTEM = (
     "Guidance: if news shows catastrophic risk, prefer A. If the roll collects a "
     "healthy credit and news is benign, prefer B. If the drop looks like noise "
     "and news is fine, C is acceptable. Never recommend B if its net credit is "
-    "not positive."
+    "not positive.\n"
+    "IMPORTANT — when the roll's new strike is BELOW the cost basis, rolling down "
+    "caps the upside at a loss: if the shares are later called away at that strike "
+    "you LOCK IN 'net_pnl_if_assigned_at_new_strike'. Weigh that locked-in loss "
+    "against Branch A's realized loss. If rolling down merely defers a comparable "
+    "(or worse) loss while capping recovery, prefer A or C over B."
 )
 
 
@@ -260,14 +343,28 @@ def _choose_branch(llm: LocalLLM, sym: str, ba: Dict[str, Any], report: Dict[str
     c = branches.get("Branch_C_Hold", {})
     ex = ba.get("existing_short_call", {}) or {}
     rc = ba.get("roll_down_contract") or {}
+    cost_basis = ba.get("raw_cost_basis")
     roll_line = (
         f" Roll into the {rc.get('strike')} call exp {rc.get('expiration')} "
         f"({rc.get('days_to_expiration')} days, premium ${rc.get('premium')})."
         if rc else " (new roll-down contract details unavailable.)"
     )
+    # The assignment-loss detail the user wants factored in.
+    assign_line = ""
+    if b.get("net_pnl_if_assigned_at_new_strike") is not None:
+        assign_line = (
+            f" New strike {b.get('new_call_strike')} vs cost basis ${cost_basis} "
+            f"(below basis={b.get('new_strike_below_cost_basis')}); if called away at the "
+            f"new strike the TOTAL realized P&L would be "
+            f"${b.get('net_pnl_if_assigned_at_new_strike')} "
+            f"(stock {b.get('stock_loss_if_assigned_at_new_strike')} + premiums "
+            f"{b.get('total_premiums_collected')})."
+        )
+    earn_line = (f"\nNext earnings: {ba.get('next_earnings_date')} — roll expiration is capped before it."
+                 if ba.get('next_earnings_date') else "")
     user = (
         f"Symbol {sym} is down {abs(ba.get('drop_percent', 0))}% from entry (now "
-        f"${ba.get('current_stock_price')}).\n"
+        f"${ba.get('current_stock_price')}, cost basis ${cost_basis}).\n"
         f"Existing short call: {ex.get('strike')} strike exp {ex.get('expiration')}, "
         f"original premium ${ex.get('original_premium')}, buy-to-close ask "
         f"${ex.get('buy_to_close_ask')}.\n"
@@ -275,10 +372,11 @@ def _choose_branch(llm: LocalLLM, sym: str, ba: Dict[str, Any], report: Dict[str
         f"capital freed ${a.get('capital_freed_up')}.\n"
         f"Branch B (Roll Down): net credit ${b.get('net_credit_received')}, "
         f"valid={b.get('is_valid')}, unrealized stock loss ${b.get('unrealized_stock_loss')}."
-        f"{roll_line}\n"
+        f"{roll_line}{assign_line}\n"
         f"Branch C (Hold): unrealized net P&L ${c.get('unrealized_net_pnl')}.\n"
         f"News sentiment: {report.get('sentiment')}, catastrophic_risk="
-        f"{report.get('catastrophic_risk')}. {report.get('rationale','')}\n"
+        f"{report.get('catastrophic_risk')}. {report.get('rationale','')}"
+        f"{earn_line}\n"
         "Return JSON with keys: recommended_branch (A, B, or C) and rationale."
     )
     try:
@@ -321,6 +419,18 @@ def _format_defense(pos, ba, report, branch, rationale) -> str:
         + (f"\n    ↳ new call: {rc.get('strike')} strike exp {rc.get('expiration')} "
            f"({rc.get('days_to_expiration')}d, Δ{rc.get('delta')}, premium ${rc.get('premium')})"
            if rc else "\n    ↳ new roll-down contract details unavailable"),
+    ]
+    bb = b.get("Branch_B_Roll_Down", {})
+    if bb.get("net_pnl_if_assigned_at_new_strike") is not None:
+        flag = " ⚠️ new strike is BELOW your cost basis" if bb.get("new_strike_below_cost_basis") else ""
+        lines.append(
+            f"    ↳ if called away at ${bb.get('new_call_strike')}: total realized P&L "
+            f"${bb.get('net_pnl_if_assigned_at_new_strike')} "
+            f"(stock ${bb.get('stock_loss_if_assigned_at_new_strike')} + premiums "
+            f"${bb.get('total_premiums_collected')}){flag}")
+    if ba.get("next_earnings_date"):
+        lines.append(f"    ↳ roll expiration capped before earnings on {ba.get('next_earnings_date')}")
+    lines += [
         f"• C — Hold: unrealized P&L ${b.get('Branch_C_Hold', {}).get('unrealized_net_pnl')}",
         f"\nNews: {report.get('sentiment')} — {report.get('rationale','')}",
     ]

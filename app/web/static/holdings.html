@@ -40,6 +40,14 @@ function Holdings() {
   // Realized P&L includes locked-in income from rolled OPEN positions, not just closed ones.
   const realized = positions.reduce((s, p) => s + (p.total_realized_pnl || 0), 0);
 
+  // Portfolio totals over OPEN positions (stock legs).
+  const totalCost = open.reduce((s, p) => s + (p.stock_purchase_price || 0) * (p.shares || 0), 0);
+  // Current value uses the live price when available, else falls back to cost basis.
+  const totalValue = open.reduce((s, p) =>
+    s + (p.current_price != null ? p.current_price : (p.stock_purchase_price || 0)) * (p.shares || 0), 0);
+  const hasLiveValue = open.some(p => p.current_price != null);
+  const totalUnrealized = totalValue - totalCost;
+
   return (
     <div className="wf-window">
       <div className="wf-top">
@@ -52,6 +60,16 @@ function Holdings() {
         <div><b>Cash</b><br />{fmtMoney(data?.cash_balance)}</div>
         <div><b>Open positions</b><br />{open.length}</div>
         <div><b>Closed</b><br />{positions.length - open.length}</div>
+        <div><b>Total cost basis</b><br />{fmtMoney(totalCost)}</div>
+        <div><b>Total current value</b><br />{hasLiveValue ? fmtMoney(totalValue) : "—"}</div>
+        <div><b>Unrealized P&amp;L</b><br />
+          {hasLiveValue
+            ? <span style={{ color: totalUnrealized >= 0 ? "var(--green)" : "var(--red)" }}>
+                {(totalUnrealized >= 0 ? "+" : "") + fmtMoney(totalUnrealized)}
+                {totalCost ? ` (${(totalUnrealized >= 0 ? "+" : "") + (totalUnrealized / totalCost * 100).toFixed(1)}%)` : ""}
+              </span>
+            : "—"}
+        </div>
         <div><b>Realized P&amp;L</b><br /><span style={{ color: realized >= 0 ? "var(--green)" : "var(--red)" }}>{fmtMoney(realized)}</span></div>
       </div>
 
@@ -81,13 +99,19 @@ function Holdings() {
                           </div>
                         : null}
                     </td>
-                    <td>{p.short_call_strike != null ? fmtMoney(p.short_call_strike) + " call" : "—"}{p.contracts ? ` ×${p.contracts}` : ""}</td>
+                    <td>
+                      {p.short_call_strike != null ? fmtMoney(p.short_call_strike) + " call" : "—"}{p.contracts ? ` ×${p.contracts}` : ""}
+                      {(p.status === "OPEN" && p.has_active_call === false)
+                        ? <div className="muted">call expired — shares held</div> : null}
+                    </td>
                     <td>{expOf(p.short_call_expiration)}</td>
                     <td>{p.short_call_premium != null ? fmtMoney(p.short_call_premium) : "—"}</td>
                     <td>{fmtPct(p.downside_buffer_percent)}</td>
                     <td style={{ color: (p.total_realized_pnl || 0) > 0 ? "var(--green)" : (p.total_realized_pnl || 0) < 0 ? "var(--red)" : "inherit" }}>
                       {(p.status === "OPEN" && !p.total_realized_pnl) ? "—" : fmtMoney(p.total_realized_pnl)}
-                      {(p.status === "OPEN" && p.total_realized_pnl) ? <div className="muted">rolled</div> : null}</td>
+                      {(p.status === "OPEN" && p.total_realized_pnl)
+                        ? <div className="muted">{p.has_active_call === false ? "premium (call expired)" : "premium collected"}</div>
+                        : null}</td>
                     <td title={p.return_basis ? `${fmtPct(p.return_percent)} over ${p.days_held}d (${p.return_basis})` : ""}
                         style={{ color: (p.annualized_return_percent || 0) > 0 ? "var(--green)" : (p.annualized_return_percent || 0) < 0 ? "var(--red)" : "inherit" }}>
                       {p.annualized_return_percent == null ? "—" : fmtPct(p.annualized_return_percent)}

@@ -121,6 +121,55 @@ def test_roll_guardrail_overrides_to_hold():
     assert final["defense_recommendation"]["branch"] == "C"
 
 
+def test_earnings_capped_max_dte():
+    from app.nodes.defense import _earnings_capped_max_dte
+    from app.config import rules
+    today = date(2026, 6, 24)
+    # No earnings date → no cap (uses rule default).
+    assert _earnings_capped_max_dte(rules, None, today) == (rules.max_days_to_expiration, None)
+    # Earnings far out (100d) → no cap.
+    cap, note = _earnings_capped_max_dte(rules, "2026-10-02", today)
+    assert cap == rules.max_days_to_expiration and note is None
+    # Earnings in 20 days → roll must expire before it (cap = 19), with a note.
+    cap, note = _earnings_capped_max_dte(rules, "2026-07-14", today)
+    assert cap == 19 and note is not None and "earnings" in note.lower()
+
+
+def test_earnings_cap_selects_earlier_roll_contract():
+    # With roll inputs NOT pre-supplied, the node fetches the chain and the earnings
+    # cap constrains contract selection. A fake earnings client returns a near date;
+    # a fake schwab returns a chain with two expirations — only the earlier (pre-
+    # earnings) one is eligible.
+    from app.nodes.defense import build_defense_quant_node
+
+    class _FakeEarnings:
+        def get_next_earnings_date(self, sym, frm, to):
+            return "2026-07-20"  # ~26 days out from today → cap ~25d
+
+    # Chain: a 20-DTE (pre-earnings, eligible) and a 40-DTE (post-earnings) call.
+    def _chain(sym, **kw):
+        return {"callExpDateMap": {
+            "2026-07-14:20": {"92.0": [{"strike": 92.0, "delta": 0.35, "bid": 1.4, "ask": 1.6,
+                                        "mark": 1.5, "openInterest": 500, "totalVolume": 200,
+                                        "volatility": 40.0, "daysToExpiration": 20}]},
+            "2026-08-03:40": {"90.0": [{"strike": 90.0, "delta": 0.35, "bid": 2.4, "ask": 2.6,
+                                        "mark": 2.5, "openInterest": 500, "totalVolume": 200,
+                                        "volatility": 40.0, "daysToExpiration": 40}]}}}
+
+    class _FakeSchwab:
+        def get_quote(self, sym): return {sym.upper(): {"quote": {"lastPrice": 90.0}}}
+        def get_option_chain(self, sym, **kw): return _chain(sym, **kw)
+
+    node = build_defense_quant_node(_FakeSchwab(), earnings_provider=lambda: _FakeEarnings(),
+                                    today=date(2026, 6, 24))
+    out = node({"position": dict(POSITION), "rejected": [], "errors": []})
+    ba = out["branch_analysis"]
+    # The chosen roll contract must be the pre-earnings 20-DTE one, not the 40-DTE.
+    assert ba["roll_down_contract"]["days_to_expiration"] == 20
+    assert ba["next_earnings_date"] == "2026-07-20"
+    assert any("earnings" in n.lower() for n in ba["roll_notes"])
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

@@ -694,10 +694,17 @@ def generate_tot_defense_branches(
     original_premium: float,
     current_call_ask: float,
     roll_down_premium: float = 0.0,
+    new_call_strike: Optional[float] = None,
 ) -> Dict[str, Any]:
     """ToT thought generator: exact P&L for the 3 downside-defense branches.
 
     Branch A (Hard Eject) | Branch B (Roll Down) | Branch C (Hold & Wait).
+
+    When ``new_call_strike`` is given, Branch B also reports the total realized
+    P&L IF the shares are called away at that new (lower) strike — i.e. locking in
+    a stock loss when the new strike is below the cost basis. This is the true
+    downside of rolling down to a strike under your basis, so the decision can
+    weigh it against just eating the loss now (Branch A).
     """
     shares = 100
     stock_loss = (current_stock_price - entry_stock_price) * shares
@@ -707,18 +714,34 @@ def generate_tot_defense_branches(
     roll_net_credit = (roll_down_premium - current_call_ask) * shares
     branch_c_unrealized_net = stock_loss + call_pnl
 
+    branch_b: Dict[str, Any] = {
+        "action": "Buy-to-close current call, sell a new lower-strike call.",
+        "net_credit_received": round(roll_net_credit, 2),
+        "unrealized_stock_loss": round(stock_loss, 2),
+        "is_valid": roll_net_credit > 0,  # invalid if it requires a net debit
+    }
+    if new_call_strike is not None:
+        # Full realized P&L if the stock recovers past the new strike and gets
+        # assigned: stock sold at new_strike + all premium cycles net.
+        stock_pnl_if_assigned = (new_call_strike - entry_stock_price) * shares
+        total_premiums = (original_premium - current_call_ask + roll_down_premium) * shares
+        net_pnl_if_assigned = stock_pnl_if_assigned + total_premiums
+        below_basis = new_call_strike < entry_stock_price
+        branch_b.update({
+            "new_call_strike": round(new_call_strike, 2),
+            "new_strike_below_cost_basis": below_basis,
+            "stock_loss_if_assigned_at_new_strike": round(stock_pnl_if_assigned, 2),
+            "total_premiums_collected": round(total_premiums, 2),
+            "net_pnl_if_assigned_at_new_strike": round(net_pnl_if_assigned, 2),
+        })
+
     return {
         "Branch_A_Liquidate": {
             "action": "Buy-to-close the call and sell the 100 shares.",
             "realized_cash_loss": round(branch_a_net_pnl, 2),
             "capital_freed_up": round(current_stock_price * shares - (current_call_ask * shares), 2),
         },
-        "Branch_B_Roll_Down": {
-            "action": "Buy-to-close current call, sell a new lower-strike call.",
-            "net_credit_received": round(roll_net_credit, 2),
-            "unrealized_stock_loss": round(stock_loss, 2),
-            "is_valid": roll_net_credit > 0,  # invalid if it requires a net debit
-        },
+        "Branch_B_Roll_Down": branch_b,
         "Branch_C_Hold": {
             "action": "Do nothing. Wait for recovery.",
             "unrealized_net_pnl": round(branch_c_unrealized_net, 2),

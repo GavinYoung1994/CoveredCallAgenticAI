@@ -195,9 +195,13 @@ def _management_tools(service: Any) -> List[Tool]:
         Tool("update_holding_status",
              "RECORD an executed/closed trade for a holding. Use this whenever the user says a "
              "position was executed, assigned, called away, sold, liquidated, or expired, or to "
-             "close a position. Identify the holding by `symbol` OR `position_id`. status is one of "
-             "ASSIGNED (called away — sale price defaults to the strike), LIQUIDATED (needs "
-             "stock_sale_price), EXPIRED. Updates cash + realized P&L. Call once PER holding.",
+             "close a position. Identify the holding by `symbol` OR `position_id`. status is one of: "
+             "EXPIRED (the CALL expired worthless — KEEP the premium as realized gain and RETAIN the "
+             "shares; do NOT sell stock and do NOT pass stock_sale_price), "
+             "ASSIGNED (called away — shares sold at the strike; sale price defaults to the strike), "
+             "LIQUIDATED (you sold the shares on the market — needs stock_sale_price). "
+             "Only ASSIGNED and LIQUIDATED sell the stock. Updates cash + realized P&L. "
+             "Call once PER holding.",
              _obj({"status": _STR, "symbol": _STR, "position_id": _STR, "stock_sale_price": _NUM,
                    "call_buyback_price": _NUM, "contracts": _INT}, ["status"]),
              lambda **kw: service.update_holding_status(**kw)),

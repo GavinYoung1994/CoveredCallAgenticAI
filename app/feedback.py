@@ -252,14 +252,48 @@ def process_defense_feedback(
 def _prompt_defense_decision(rec: Dict[str, Any], *, input_func=input, output_func=print) -> Dict[str, Any]:
     ba = rec.get("branch_analysis", {})
     b = ba.get("branches", {})
+    ex = ba.get("existing_short_call", {}) or {}
+    rc = ba.get("roll_down_contract") or {}
     rec_branch = str(rec.get("branch", "C")).upper()[:1]
+
+    cur_ask = ba.get("current_call_ask") or ex.get("buy_to_close_ask") or 0
+    # If we couldn't price the existing call from the chain (e.g. its strike is
+    # now deep OTM/illiquid), flag it so the human knows to fill in a real quote.
+    ask_note = "" if cur_ask else "  ⚠️ could not fetch a live buyback quote — enter it manually"
+    ex_strike = ex.get("strike")
+    ex_exp = str(ex.get("expiration") or "").split(":")[0] or "—"
+    entry_price = ba.get("raw_cost_basis")
+
+    # Existing holding + contract details (so the human sees what they hold).
+    holding_lines = (
+        f"  Current holding: {ex.get('shares') or '?'} shares @ ${entry_price} "
+        f"(now ${ba.get('current_stock_price')})\n"
+        f"  Existing short call: {ex_strike} strike exp {ex_exp}, "
+        f"original premium ${ex.get('original_premium')}, buy-to-close ask ${cur_ask}{ask_note}\n"
+    )
+    roll_line = ""
+    if rc:
+        roll_line = (f"     ↳ suggested roll: {rc.get('strike')} call exp {rc.get('expiration')} "
+                     f"({rc.get('days_to_expiration')}d, Δ{rc.get('delta')}, premium ${rc.get('premium')})\n")
+    bb = b.get("Branch_B_Roll_Down", {})
+    if bb.get("net_pnl_if_assigned_at_new_strike") is not None:
+        flag = "  ⚠️ new strike BELOW cost basis" if bb.get("new_strike_below_cost_basis") else ""
+        roll_line += (f"     ↳ if called away at ${bb.get('new_call_strike')}: total realized P&L "
+                      f"${bb.get('net_pnl_if_assigned_at_new_strike')} "
+                      f"(stock ${bb.get('stock_loss_if_assigned_at_new_strike')} + premiums "
+                      f"${bb.get('total_premiums_collected')}){flag}\n")
+    if ba.get("next_earnings_date"):
+        roll_line += f"     ↳ roll expiration capped before earnings on {ba.get('next_earnings_date')}\n"
+
     output_func(
         f"\n{rec['symbol']} — position {rec.get('position_id')} is down "
         f"{ba.get('drop_percent')}% (now ${ba.get('current_stock_price')}).\n"
+        + holding_lines +
         f"  Agent recommends: branch {rec_branch} — {_BRANCH_LABEL.get(rec_branch, rec_branch)}\n"
         f"  A Hard Eject: realized loss ${b.get('Branch_A_Liquidate', {}).get('realized_cash_loss')}\n"
         f"  B Roll Down: net credit ${b.get('Branch_B_Roll_Down', {}).get('net_credit_received')} "
         f"(valid={b.get('Branch_B_Roll_Down', {}).get('is_valid')})\n"
+        + roll_line +
         f"  C Hold: unrealized P&L ${b.get('Branch_C_Hold', {}).get('unrealized_net_pnl')}\n"
         f"  Reasoning: {rec.get('rationale', '')}")
     choice = ""
@@ -275,8 +309,10 @@ def _prompt_defense_decision(rec: Dict[str, Any], *, input_func=input, output_fu
     notes = input_func("  Notes (your reasoning): ").strip()
     decision: Dict[str, Any] = {"verdict": VERDICT_APPROVE, "branch": choice, "notes": notes}
     cur_price = ba.get("current_stock_price", 0)
-    cur_ask = ba.get("current_call_ask", 0)
-    roll_prem = ba.get("roll_down_premium", 0)
+    # Default the roll's new premium/strike to the suggested roll contract when present.
+    roll_prem = rc.get("premium") if rc else ba.get("roll_down_premium", 0)
+    roll_strike = rc.get("strike") if rc else None
+    roll_exp = rc.get("expiration") if rc else ""
     if choice == "A":
         decision["fill"] = {
             "stock_sale_price": float(input_func(f"  Stock sale price [{cur_price}]: ").strip() or cur_price),
@@ -285,9 +321,11 @@ def _prompt_defense_decision(rec: Dict[str, Any], *, input_func=input, output_fu
     elif choice == "B":
         decision["fill"] = {
             "call_buyback_price": float(input_func(f"  Call buyback price [{cur_ask}]: ").strip() or cur_ask),
-            "new_call_strike": float(input_func("  New (lower) call strike: ").strip()),
+            "new_call_strike": float(input_func(f"  New (lower) call strike [{roll_strike or ''}]: ").strip()
+                                     or roll_strike),
             "new_call_premium": float(input_func(f"  New call premium [{roll_prem}]: ").strip() or roll_prem),
-            "new_call_expiration": input_func("  New call expiration (YYYY-MM-DD): ").strip(),
+            "new_call_expiration": (input_func(f"  New call expiration (YYYY-MM-DD) [{roll_exp}]: ").strip()
+                                    or roll_exp),
             "contracts": int(input_func("  Contracts [1]: ").strip() or 1)}
     return decision
 
@@ -298,8 +336,11 @@ _VERDICT_KEYS = {"A": VERDICT_APPROVE, "D": VERDICT_DENY, "S": VERDICT_SKIP}
 
 def _render_candidate(rec: Dict[str, Any], i: int, n: int) -> str:
     c = rec.get("contract", {})
+    px = rec.get("underlying_price")
+    price_line = f"  Current stock price: ${px}\n" if px else ""
     return (
         f"\n[{i}/{n}] {rec['symbol']} — Grade {rec.get('grade')} (score {rec.get('score')})\n"
+        f"{price_line}"
         f"  Sell {c.get('strike')} call exp {str(c.get('expiration_key','')).split(':')[0]} "
         f"({c.get('days_to_expiration')}d), mark ${c.get('mark')}\n"
         f"  Annualized {rec.get('annualized_yield_percent')}% | sentiment {rec.get('sentiment')}\n"
