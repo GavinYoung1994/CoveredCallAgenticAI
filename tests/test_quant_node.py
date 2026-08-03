@@ -73,13 +73,23 @@ def _client() -> SchwabClient:
     )
 
 
-def _run(symbols_prices, cash=100_000.0):
+def _run(symbols_prices, cash=100_000.0, rules=TEST_RULES):
     scout = [{"symbol": s, "fundamentals": {"last_price": p}, "is_optionable": True}
              for s, p in symbols_prices]
-    node = build_quant_node(_client(), rules=TEST_RULES, today=date(2026, 6, 23))
+    node = build_quant_node(_client(), rules=rules, today=date(2026, 6, 23))
     state = new_screener_state(watchlist=[], account_cash=cash, run_id="r", run_timestamp="t")
     state["scout_candidates"] = scout
     return node(state)
+
+
+def test_iv_ratio_computed_even_when_rich_iv_not_required():
+    # Regression: iv_to_hv_ratio was only set when require_rich_iv=True, so on the
+    # default path the Risk Manager scored every candidate at ratio 1.0.
+    relaxed = dataclasses.replace(TEST_RULES, require_rich_iv=False)
+    out = _run([("GOOD", 100.0)], rules=relaxed)
+    assert len(out["quant_candidates"]) == 1
+    c = out["quant_candidates"][0]
+    assert c["iv_rank"].get("iv_to_hv_ratio") is not None and c["iv_rank"]["iv_to_hv_ratio"] > 1.1
 
 
 def test_quant_happy_path():

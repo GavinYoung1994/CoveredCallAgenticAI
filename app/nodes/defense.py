@@ -209,6 +209,20 @@ def build_defense_quant_node(
         price, price_err = _resolve_current_price(client, state, sym)
         if price_err:
             errors.append(price_err)
+
+        # A non-positive price means the quote FAILED (empty snapshot, halt,
+        # after-hours with no data) — NOT that the stock is fine. Surface it as an
+        # error and skip rather than silently reporting "within cushion / no
+        # action", which would mask a real breach on a name we couldn't price.
+        if price <= 0:
+            msg = (f"Defense: could not get a current price for {sym} (got {price}); "
+                   f"skipping — cannot assess breach.")
+            logger.warning(msg)
+            errors.append(msg)
+            return _with_errors(
+                {"current_stock_price": price, "breach_detected": False, "price_unavailable": True},
+                errors)
+
         entry = float(pos["stock_purchase_price"])
         drop_pct = ((price - entry) / entry * 100.0) if entry else 0.0
 

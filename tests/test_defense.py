@@ -121,6 +121,16 @@ def test_roll_guardrail_overrides_to_hold():
     assert final["defense_recommendation"]["branch"] == "C"
 
 
+def test_zero_price_surfaces_error_not_silent_ok():
+    # A failed/empty quote (price 0) must be reported as an error + price_unavailable,
+    # NOT silently treated as "within cushion / no action" (which would mask a breach).
+    final = _run(price=0.0, call_ask=0.5, roll=1.5)
+    assert final["breach_detected"] is False
+    assert final.get("price_unavailable") is True
+    assert any("could not get a current price" in e.lower() for e in final.get("errors", []))
+    assert "defense_recommendation" not in final
+
+
 def test_earnings_capped_max_dte():
     from app.nodes.defense import _earnings_capped_max_dte
     from app.config import rules

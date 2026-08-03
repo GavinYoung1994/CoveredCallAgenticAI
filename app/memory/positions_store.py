@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Callable, List, Optional, Union
 
 from app.config import settings
-from app.memory.decision_store import _connect, _realized_option_pnl  # schema + realized-P&L helper
+from app.memory.decision_store import (  # schema + P&L helpers
+    _connect, _realized_option_pnl, _active_call_qty, cash_effect)
 from app.state import OpenPosition
 
 logger = logging.getLogger("positions-store")
@@ -40,21 +41,16 @@ def load_open_positions(db_path: Optional[Union[str, Path]] = None) -> List[Open
             call = conn.execute(
                 "SELECT strike_price, expiration_date, price, quantity FROM transactions "
                 "WHERE position_id = ? AND asset_type = 'OPTION' AND action = 'SELL_TO_OPEN' "
-                "ORDER BY timestamp DESC, transaction_id DESC LIMIT 1",
+                "ORDER BY timestamp DESC, rowid DESC LIMIT 1",
                 (pid,),
             ).fetchone()
             if not call or call["strike_price"] is None:
                 logger.warning("Skipping %s: no opening short-call leg found.", pid)
                 continue
             # Skip if the short call is no longer active (expired/closed): there is
-            # no covered call to defend, only shares held.
-            n_sto = int(conn.execute(
-                "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
-                "AND action = 'SELL_TO_OPEN'", (pid,)).fetchone()[0] or 0)
-            n_btc = int(conn.execute(
-                "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
-                "AND action = 'BUY_TO_CLOSE'", (pid,)).fetchone()[0] or 0)
-            if n_sto <= n_btc:
+            # no covered call to defend, only shares held. Uses contract QUANTITY
+            # so a partial buyback still leaves the position monitored.
+            if _active_call_qty(conn, pid) <= 0:
                 logger.info("Skipping %s in defense scan: call expired/closed, no covered call to defend "
                             "(shares still held).", pid)
                 continue
@@ -127,16 +123,10 @@ def list_holdings_detailed(status: Optional[str] = None,
             call = conn.execute(
                 "SELECT strike_price, expiration_date, price, quantity FROM transactions "
                 "WHERE position_id = ? AND asset_type = 'OPTION' AND action = 'SELL_TO_OPEN' "
-                "ORDER BY timestamp DESC, transaction_id DESC LIMIT 1", (pid,)).fetchone()
+                "ORDER BY timestamp DESC, rowid DESC LIMIT 1", (pid,)).fetchone()
             # Is that short call still active, or has it been closed (rolled away /
-            # expired)? # open calls = # SELL_TO_OPEN − # BUY_TO_CLOSE.
-            n_sto = int(conn.execute(
-                "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
-                "AND action = 'SELL_TO_OPEN'", (pid,)).fetchone()[0] or 0)
-            n_btc = int(conn.execute(
-                "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
-                "AND action = 'BUY_TO_CLOSE'", (pid,)).fetchone()[0] or 0)
-            has_active_call = n_sto > n_btc
+            # expired)? Active iff open contract QUANTITY > 0 (handles partials).
+            has_active_call = _active_call_qty(conn, pid) > 0
             if not has_active_call:
                 call = None  # call expired/closed — shares still held, no covered call
             shares = int(conn.execute(
@@ -184,6 +174,45 @@ def list_holdings_detailed(status: Optional[str] = None,
                 "annualized_return_percent": ann_pct,
                 "days_held": days,
                 "return_basis": basis,
+            })
+        return out
+    finally:
+        conn.close()
+
+
+def list_transactions(db_path: Optional[Union[str, Path]] = None,
+                      limit: Optional[int] = None) -> List[dict]:
+    """Every ledger transaction (newest first) for the history view.
+
+    Each row: timestamp, symbol, position_id, asset_type, action, quantity,
+    price, strike/expiration (options), fees, and the signed ``cash_effect`` that
+    transaction had on the account (so the UI can show the running money flow).
+    """
+    conn = _connect(db_path or settings.sql_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        clause = f"LIMIT {int(limit)}" if limit else ""
+        rows = conn.execute(
+            "SELECT t.transaction_id, t.timestamp, t.position_id, p.symbol, t.asset_type, "
+            "       t.action, t.quantity, t.price, t.fees, t.strike_price, t.expiration_date "
+            "FROM transactions t LEFT JOIN positions p ON p.position_id = t.position_id "
+            f"ORDER BY t.timestamp DESC, t.rowid DESC {clause}").fetchall()
+        out: List[dict] = []
+        for r in rows:
+            out.append({
+                "transaction_id": r["transaction_id"],
+                "timestamp": r["timestamp"],
+                "symbol": r["symbol"] or (str(r["position_id"]).split("_")[0] if r["position_id"] else None),
+                "position_id": r["position_id"],
+                "asset_type": r["asset_type"],
+                "action": r["action"],
+                "quantity": r["quantity"],
+                "price": r["price"],
+                "fees": r["fees"],
+                "strike_price": r["strike_price"],
+                "expiration_date": r["expiration_date"],
+                "cash_effect": cash_effect(r["asset_type"], r["action"], r["quantity"],
+                                           r["price"], r["fees"] or 0.0),
             })
         return out
     finally:

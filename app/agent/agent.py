@@ -97,12 +97,17 @@ class CoveredCallAgent:
         return "\n\n".join(parts)
 
     def _mutated(self, steps: List[Dict[str, Any]]) -> bool:
-        """Did any state-changing tool succeed this turn?"""
+        """Did any state-changing tool ACTUALLY change state this turn?"""
         for s in steps:
             if s["tool"] in _MUTATING_TOOLS:
                 obs = s.get("observation")
-                if not (isinstance(obs, dict) and obs.get("error")):
-                    return True
+                if isinstance(obs, dict):
+                    # A tool that errored, or explicitly reported no change
+                    # (updated=False), did NOT mutate — don't let it satisfy the
+                    # anti-hallucination guard.
+                    if obs.get("error") or obs.get("updated") is False:
+                        continue
+                return True
         return False
 
     def chat(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:

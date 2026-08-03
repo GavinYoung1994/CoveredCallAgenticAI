@@ -131,13 +131,17 @@ def _assess_iv(
         greeks = eng.black_scholes_call_greeks(price, contract["strike"], dte, iv_pct / 100.0)
 
     hv = eng.calculate_historical_volatility(candles)
-    iv_info = {"current_iv_percent": iv_pct, "realized_vol_percent": hv.get("annualized_hv_percent")}
+    hv_pct = hv.get("annualized_hv_percent")
+    iv_info = {"current_iv_percent": iv_pct, "realized_vol_percent": hv_pct}
+    # ALWAYS record the IV/HV richness ratio when both are available — the Risk
+    # Manager uses it for scoring and the human-facing card regardless of whether
+    # rich IV is a hard filter. Only the REJECTION is gated by require_rich_iv.
+    if iv_pct and hv_pct:
+        iv_info["iv_to_hv_ratio"] = round(iv_pct / hv_pct, 2)
     if rules.require_rich_iv:
-        hv_pct = hv.get("annualized_hv_percent")
-        if not iv_pct or not hv_pct:
+        if "iv_to_hv_ratio" not in iv_info:
             raise _Reject("Cannot assess IV richness (missing IV/HV).")
-        ratio = iv_pct / hv_pct
-        iv_info["iv_to_hv_ratio"] = round(ratio, 2)
+        ratio = iv_info["iv_to_hv_ratio"]
         if ratio < rules.iv_richness_min_ratio:
             raise _Reject(f"IV not rich: IV {iv_pct:.1f}% / HV {hv_pct:.1f}% = {ratio:.2f} "
                           f"< {rules.iv_richness_min_ratio}.")

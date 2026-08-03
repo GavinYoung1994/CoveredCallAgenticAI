@@ -249,6 +249,16 @@ def process_defense_feedback(
     return out
 
 
+def _req_str(input_func, output_func, prompt: str, default) -> str:
+    """Prompt for a non-empty string, requiring input when there's no default."""
+    while True:
+        raw = input_func(prompt).strip()
+        val = raw or (default or "")
+        if val:
+            return val
+        output_func("    A value is required.")
+
+
 def _prompt_defense_decision(rec: Dict[str, Any], *, input_func=input, output_func=print) -> Dict[str, Any]:
     ba = rec.get("branch_analysis", {})
     b = ba.get("branches", {})
@@ -319,13 +329,24 @@ def _prompt_defense_decision(rec: Dict[str, Any], *, input_func=input, output_fu
             "call_buyback_price": float(input_func(f"  Call buyback price [{cur_ask}]: ").strip() or cur_ask),
             "contracts": int(input_func("  Contracts [1]: ").strip() or 1)}
     elif choice == "B":
+        # No suggested roll contract (deep-OTM/illiquid) → these have no default,
+        # so REQUIRE the human to type them rather than crashing on float(None).
+        def _req_float(prompt: str, default) -> float:
+            while True:
+                raw = input_func(prompt).strip()
+                val = raw or (default if default not in (None, "") else None)
+                if val not in (None, ""):
+                    try:
+                        return float(val)
+                    except (TypeError, ValueError):
+                        pass
+                output_func("    Please enter a number.")
         decision["fill"] = {
             "call_buyback_price": float(input_func(f"  Call buyback price [{cur_ask}]: ").strip() or cur_ask),
-            "new_call_strike": float(input_func(f"  New (lower) call strike [{roll_strike or ''}]: ").strip()
-                                     or roll_strike),
-            "new_call_premium": float(input_func(f"  New call premium [{roll_prem}]: ").strip() or roll_prem),
-            "new_call_expiration": (input_func(f"  New call expiration (YYYY-MM-DD) [{roll_exp}]: ").strip()
-                                    or roll_exp),
+            "new_call_strike": _req_float(f"  New (lower) call strike [{roll_strike or ''}]: ", roll_strike),
+            "new_call_premium": _req_float(f"  New call premium [{roll_prem or ''}]: ", roll_prem),
+            "new_call_expiration": _req_str(input_func, output_func,
+                                            f"  New call expiration (YYYY-MM-DD) [{roll_exp}]: ", roll_exp),
             "contracts": int(input_func("  Contracts [1]: ").strip() or 1)}
     return decision
 

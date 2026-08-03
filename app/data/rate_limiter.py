@@ -10,6 +10,7 @@ assert throttling behaviour without real delays.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import deque
 from typing import Callable, Deque
@@ -33,19 +34,42 @@ class RateLimiter:
         self._time = time_func
         self._sleep = sleep_func
         self._calls: Deque[float] = deque()
+        # Serialize acquire() so concurrent callers (e.g. a shared limiter used by
+        # several clients across threads) can't both slip past the cap.
+        self._lock = threading.Lock()
 
     def acquire(self) -> float:
         """Block if needed, then record a call. Returns seconds actually slept."""
         slept_total = 0.0
         while True:
-            now = self._time()
-            while self._calls and (now - self._calls[0]) >= self.period:
-                self._calls.popleft()
-            if len(self._calls) < self.max_calls:
-                self._calls.append(now)
-                return slept_total
-            wait = self.period - (now - self._calls[0])
+            with self._lock:
+                now = self._time()
+                while self._calls and (now - self._calls[0]) >= self.period:
+                    self._calls.popleft()
+                if len(self._calls) < self.max_calls:
+                    self._calls.append(now)
+                    return slept_total
+                wait = self.period - (now - self._calls[0])
+            # Sleep OUTSIDE the lock so other threads can make progress/re-check.
             if wait > 0:
                 logger.info("[%s] rate limit reached; sleeping %.2fs", self.name, wait)
                 self._sleep(wait)
                 slept_total += wait
+
+
+# ── process-wide shared limiters (one quota per upstream API) ─────────────
+_shared: dict = {}
+_shared_lock = threading.Lock()
+
+
+def get_shared_limiter(name: str, max_calls: int, period: float) -> RateLimiter:
+    """Return a single process-wide RateLimiter for ``name``, created on first
+    use. Multiple clients that hit the SAME upstream account (e.g. every
+    massive.com client sharing one API key/quota) must share one limiter so
+    their combined request rate stays under the cap."""
+    with _shared_lock:
+        lim = _shared.get(name)
+        if lim is None:
+            lim = RateLimiter(max_calls, period, name=name)
+            _shared[name] = lim
+        return lim

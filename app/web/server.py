@@ -84,7 +84,8 @@ class Jobs:
 
     @property
     def last(self) -> Dict[str, Any]:
-        return dict(self._last)
+        with self._lock:
+            return dict(self._last)
 
     def start(self, name: str, fn: Callable[[], Any]) -> bool:
         with self._lock:
@@ -96,13 +97,16 @@ class Jobs:
             logger.info("▶ Starting workflow: %s", name)
             try:
                 result = fn()
-                self._last[name] = {"ok": True, "summary": _summarize(name, result)}
+                entry = {"ok": True, "summary": _summarize(name, result)}
                 logger.info("✔ Workflow %s finished.", name)
             except Exception as exc:  # noqa: BLE001
-                self._last[name] = {"ok": False, "error": str(exc)}
+                entry = {"ok": False, "error": str(exc)}
                 logger.exception("✖ Workflow %s failed", name)
             finally:
+                # Mutate shared state under the lock — the `last` property and
+                # /api/status read _last concurrently from the request thread.
                 with self._lock:
+                    self._last[name] = entry
                     self._running = None
 
         if self.run_async:
@@ -183,6 +187,13 @@ def _live_price_provider(symbols):
         return {}
 
 
+def _default_transactions_provider() -> Dict[str, Any]:
+    """Full transaction history from the SQL ledger, newest first."""
+    from app.memory.positions_store import list_transactions
+    from app.config import settings as _s
+    return {"transactions": list_transactions(db_path=_s.sql_db_path)}
+
+
 def _default_holdings_provider() -> Dict[str, Any]:
     """Cash + every position with its covered-call contract details (from SQL),
     enriched with a live current stock price per holding."""
@@ -218,6 +229,7 @@ def create_app(
     agent_provider: Optional[Callable[[], Any]] = None,
     runners: Optional[Dict[str, Callable[[], Any]]] = None,
     holdings_provider: Optional[Callable[[], Dict[str, Any]]] = None,
+    transactions_provider: Optional[Callable[[], Dict[str, Any]]] = None,
     log_buffer: Optional[LogBuffer] = None,
     run_async: bool = True,
     attach_logging: bool = True,
@@ -236,6 +248,7 @@ def create_app(
     jobs = Jobs(run_async=run_async)
     runners = runners if runners is not None else _default_runners()
     holdings_provider = holdings_provider or _default_holdings_provider
+    transactions_provider = transactions_provider or _default_transactions_provider
     # The agent's workflow tools start background jobs via this same launcher, so
     # agent-triggered runs are non-blocking and show up in the workflow windows.
     if agent_provider is None:
@@ -259,6 +272,18 @@ def create_app(
             return jsonify(holdings_provider())
         except Exception as exc:  # noqa: BLE001
             logger.exception("Holdings fetch failed")
+            return jsonify({"error": str(exc)}), 500
+
+    @app.get("/transactions")
+    def transactions_window():  # noqa: ANN202
+        return send_from_directory(_STATIC, "transactions.html")
+
+    @app.get("/api/transactions")
+    def api_transactions():  # noqa: ANN202
+        try:
+            return jsonify(transactions_provider())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Transactions fetch failed")
             return jsonify({"error": str(exc)}), 500
 
     @app.post("/api/chat")

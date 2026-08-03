@@ -225,6 +225,19 @@ def _realized_option_pnl(conn: sqlite3.Connection, position_id: str) -> float:
     return round(sum(cash_effect("OPTION", r[0], r[1], r[2], r[3] or 0.0) for r in rows), 2)
 
 
+def _active_call_qty(conn: sqlite3.Connection, position_id: str) -> int:
+    """Contracts of short call still OPEN = SUM(SELL_TO_OPEN qty) − SUM(BUY_TO_CLOSE
+    qty). Uses QUANTITY, not a leg COUNT, so partial buybacks and multi-contract
+    positions are tracked correctly."""
+    row = conn.execute(
+        "SELECT "
+        " COALESCE(SUM(CASE WHEN action='SELL_TO_OPEN' THEN quantity END),0) "
+        " - COALESCE(SUM(CASE WHEN action='BUY_TO_CLOSE' THEN quantity END),0) "
+        "FROM transactions WHERE position_id = ? AND asset_type = 'OPTION'",
+        (position_id,)).fetchone()
+    return int(row[0] or 0)
+
+
 def expire_option(
     *,
     position_id: str,
@@ -248,27 +261,19 @@ def expire_option(
         if row is None:
             raise ValueError(f"Position {position_id} not found.")
         # Idempotency guard: only expire if there is actually an OPEN short call
-        # (# SELL_TO_OPEN > # BUY_TO_CLOSE). Without this, calling "expire" twice
-        # would append meaningless BUY_TO_CLOSE @ $0 legs and corrupt the ledger.
-        n_sto = int(conn.execute(
-            "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
-            "AND action = 'SELL_TO_OPEN'", (position_id,)).fetchone()[0] or 0)
-        n_btc = int(conn.execute(
-            "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
-            "AND action = 'BUY_TO_CLOSE'", (position_id,)).fetchone()[0] or 0)
-        if n_sto <= n_btc:
+        # (active contracts > 0). Without this, calling "expire" twice would
+        # append meaningless BUY_TO_CLOSE @ $0 legs and corrupt the ledger.
+        active_qty = _active_call_qty(conn, position_id)
+        if active_qty <= 0:
             realized = _realized_option_pnl(conn, position_id)
             logger.info("Expire no-op on %s: no active short call to expire "
                         "(already closed). Realized P&L unchanged at $%.2f.", position_id, realized)
             return {"position_id": position_id, "status": row["status"], "shares_retained": True,
                     "total_realized_pnl": realized, "action": "NO_ACTIVE_CALL",
                     "note": "No active covered call to expire; nothing changed."}
-        # Size the expiration to the currently-open short call.
-        open_call = conn.execute(
-            "SELECT quantity FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
-            "AND action = 'SELL_TO_OPEN' ORDER BY timestamp DESC, transaction_id DESC LIMIT 1",
-            (position_id,)).fetchone()
-        qty = int(contracts or (open_call["quantity"] if open_call else 1) or 1)
+        # Expire the full open quantity (an explicit ``contracts`` may expire fewer).
+        qty = int(contracts) if contracts else active_qty
+        qty = min(qty, active_qty)
         seq = conn.execute("SELECT COUNT(*) FROM transactions WHERE position_id = ?",
                            (position_id,)).fetchone()[0]
         # BUY_TO_CLOSE @ $0 → premium fully realized, no cash movement, shares kept.
@@ -317,6 +322,13 @@ def close_position(
     Returns a summary dict. ``status`` is typically ASSIGNED, LIQUIDATED, or
     EXPIRED (the call expired worthless; pass no prices to just keep the shares).
     """
+    # A $0 (or negative) stock sale is never valid and previously booked the
+    # entire cost basis as a false realized loss — reject it up front.
+    if stock_sale_price is not None and float(stock_sale_price) <= 0:
+        raise ValueError(
+            f"close_position: stock_sale_price must be positive (got {stock_sale_price}). "
+            f"For an ASSIGNED close pass the strike; for LIQUIDATED pass the market fill.")
+
     conn = _connect(db_path or settings.sql_db_path)
     try:
         row = conn.execute(
@@ -330,19 +342,15 @@ def close_position(
                 "AND asset_type = 'STOCK' AND action = 'BUY_TO_OPEN'", (position_id,)).fetchone()
             shares = int(sh[0] or 0)
 
-        # Only buy back the short call if one is actually OPEN. Guards against a
-        # phantom buyback (double-count / cash error) when closing a position
-        # whose call already expired or was rolled away.
+        # Only buy back the short call if one is actually OPEN, and close the FULL
+        # open quantity (guards a phantom buyback when the call already expired/
+        # rolled away, and the multi-contract case where a stale contracts=1
+        # default would leave contracts uncovered).
         if call_buyback_price is not None:
-            n_sto = int(conn.execute(
-                "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
-                "AND action = 'SELL_TO_OPEN'", (position_id,)).fetchone()[0] or 0)
-            n_btc = int(conn.execute(
-                "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
-                "AND action = 'BUY_TO_CLOSE'", (position_id,)).fetchone()[0] or 0)
-            if n_sto > n_btc:
+            active_qty = _active_call_qty(conn, position_id)
+            if active_qty > 0:
                 add_transaction(conn, transaction_id=f"{position_id}_BTC", position_id=position_id,
-                                asset_type="OPTION", action="BUY_TO_CLOSE", quantity=contracts,
+                                asset_type="OPTION", action="BUY_TO_CLOSE", quantity=active_qty,
                                 price=call_buyback_price, fees=fees)
             else:
                 logger.info("Ignoring call_buyback_price for %s: no active short call to close.",
@@ -383,11 +391,19 @@ def roll_position(
                            (position_id,)).fetchone()
         if row is None:
             raise ValueError(f"Position {position_id} not found.")
+        # A roll buys back an EXISTING short call. If none is open (already expired
+        # / rolled away), skip the buyback leg so we don't book a phantom cost —
+        # the roll then just sells a new call.
+        active_qty = _active_call_qty(conn, position_id)
         seq = conn.execute("SELECT COUNT(*) FROM transactions WHERE position_id = ?",
                            (position_id,)).fetchone()[0]
-        add_transaction(conn, transaction_id=f"{position_id}_BTC{seq}", position_id=position_id,
-                        asset_type="OPTION", action="BUY_TO_CLOSE", quantity=contracts,
-                        price=call_buyback_price, fees=fees)
+        if active_qty > 0:
+            add_transaction(conn, transaction_id=f"{position_id}_BTC{seq}", position_id=position_id,
+                            asset_type="OPTION", action="BUY_TO_CLOSE", quantity=min(contracts, active_qty),
+                            price=call_buyback_price, fees=fees)
+        else:
+            logger.warning("Roll on %s has no active call to buy back; recording only the new "
+                           "short call (no buyback leg).", position_id)
         add_transaction(conn, transaction_id=f"{position_id}_STO{seq + 1}", position_id=position_id,
                         asset_type="OPTION", action="SELL_TO_OPEN", quantity=contracts,
                         price=new_call_premium, fees=fees, strike_price=new_call_strike,
@@ -398,7 +414,8 @@ def roll_position(
         conn.execute("UPDATE positions SET total_realized_pnl = ? WHERE position_id = ?",
                      (realized, position_id))
         conn.commit()
-        net_credit = round((new_call_premium - call_buyback_price) * contracts * 100 - 2 * fees, 2)
+        buyback_cost = call_buyback_price if active_qty > 0 else 0.0
+        net_credit = round((new_call_premium - buyback_cost) * contracts * 100 - 2 * fees, 2)
         logger.info("Rolled %s: bought back @ %.2f, sold %.1f call @ %.2f (net credit %+.2f, "
                     "realized option P&L $%.2f)",
                     position_id, call_buyback_price, new_call_strike, new_call_premium,
@@ -428,7 +445,7 @@ def repair_zero_price_assignments(db_path: Optional[Union[str, Path]] = None) ->
             call = conn.execute(
                 "SELECT strike_price FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
                 "AND action = 'SELL_TO_OPEN' AND strike_price IS NOT NULL "
-                "ORDER BY timestamp DESC, transaction_id DESC LIMIT 1", (pid,)).fetchone()
+                "ORDER BY timestamp DESC, rowid DESC LIMIT 1", (pid,)).fetchone()
             if not call:
                 continue
             strike = float(call["strike_price"])

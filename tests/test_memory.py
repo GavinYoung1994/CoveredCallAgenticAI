@@ -237,9 +237,20 @@ def test_repair_zero_price_assignments():
         set_cash_balance(50_000.0, db)
         ds.open_position(position_id="SOLS_1", symbol="SOLS", stock_purchase_price=86.95, shares=100,
                          call_strike=95.0, call_premium=4.9, call_expiration="2026-07-28", db_path=db)
-        # Simulate the bug: close ASSIGNED with a $0 stock sale.
-        ds.close_position(position_id="SOLS_1", status="ASSIGNED",
-                          stock_sale_price=0.0, call_buyback_price=0.0, db_path=db)
+        # Simulate a LEGACY corrupted row: a $0 SELL_TO_CLOSE stock leg (the old
+        # bug). close_position now rejects $0 sales, so write the bad legs
+        # directly — this is exactly the state repair_zero_price_assignments fixes.
+        conn = ds._connect(db)
+        try:
+            ds.add_transaction(conn, transaction_id="SOLS_1_BTC", position_id="SOLS_1",
+                               asset_type="OPTION", action="BUY_TO_CLOSE", quantity=1, price=0.0)
+            ds.add_transaction(conn, transaction_id="SOLS_1_STC", position_id="SOLS_1",
+                               asset_type="STOCK", action="SELL_TO_CLOSE", quantity=100, price=0.0)
+            conn.execute("UPDATE positions SET status='ASSIGNED', total_realized_pnl=? "
+                         "WHERE position_id='SOLS_1'", (ds._position_realized_pnl(conn, "SOLS_1"),))
+            conn.commit()
+        finally:
+            conn.close()
         cash_after_bug = get_cash_balance(db)
         # Repair: should fix the sale price to the 95 strike + credit cash $9,500.
         fixed = ds.repair_zero_price_assignments(db)
@@ -248,6 +259,86 @@ def test_repair_zero_price_assignments():
         assert get_cash_balance(db) == cash_after_bug + 9500.0
         # Idempotent: a second run finds nothing to fix.
         assert ds.repair_zero_price_assignments(db) == []
+    finally:
+        os.path.exists(db) and os.unlink(db)
+
+
+def test_list_transactions_history():
+    db = _tmp_db()
+    try:
+        from app.memory.positions_store import list_transactions
+        ds.open_position(position_id="T_1", symbol="T", stock_purchase_price=50.0, shares=100,
+                         call_strike=55.0, call_premium=1.5, call_expiration="2026-08-21", db_path=db)
+        txns = list_transactions(db_path=db)
+        # open_position books a stock buy + a call sell.
+        assert len(txns) == 2
+        actions = {t["action"]: t for t in txns}
+        assert actions["BUY_TO_OPEN"]["symbol"] == "T"
+        assert actions["BUY_TO_OPEN"]["cash_effect"] == -5000.0     # 100 sh @ $50
+        assert actions["SELL_TO_OPEN"]["cash_effect"] == 150.0      # 1 call @ $1.50 ×100
+        assert actions["SELL_TO_OPEN"]["strike_price"] == 55.0
+    finally:
+        os.path.exists(db) and os.unlink(db)
+
+
+def test_close_position_rejects_zero_stock_sale():
+    db = _tmp_db()
+    try:
+        ds.open_position(position_id="Z_1", symbol="Z", stock_purchase_price=60.0, shares=100,
+                         call_strike=65.0, call_premium=2.0, call_expiration="2026-08-21", db_path=db)
+        raised = False
+        try:
+            ds.close_position(position_id="Z_1", status="LIQUIDATED", stock_sale_price=0.0, db_path=db)
+        except ValueError:
+            raised = True
+        assert raised, "a $0 stock sale must be rejected, not booked as a full-cost loss"
+    finally:
+        os.path.exists(db) and os.unlink(db)
+
+
+def test_partial_buyback_keeps_call_active():
+    db = _tmp_db()
+    try:
+        from app.memory.positions_store import list_holdings_detailed
+        # 2-contract covered call, then buy back only 1 contract (partial).
+        ds.open_position(position_id="M_1", symbol="M", stock_purchase_price=100.0, shares=200,
+                         call_strike=105.0, call_premium=2.0, call_expiration="2026-08-21",
+                         contracts=2, db_path=db)
+        conn = ds._connect(db)
+        try:
+            ds.add_transaction(conn, transaction_id="M_1_BTC1", position_id="M_1",
+                               asset_type="OPTION", action="BUY_TO_CLOSE", quantity=1, price=0.5)
+            conn.commit()
+        finally:
+            conn.close()
+        conn = ds._connect(db)
+        assert ds._active_call_qty(conn, "M_1") == 1   # 2 sold − 1 bought back
+        conn.close()
+        h = next(x for x in list_holdings_detailed(db_path=db) if x["position_id"] == "M_1")
+        assert h["has_active_call"] is True            # a live contract remains (was False under leg-COUNT)
+    finally:
+        os.path.exists(db) and os.unlink(db)
+
+
+def test_roll_after_expire_adds_no_phantom_buyback():
+    db = _tmp_db()
+    try:
+        from app.memory.account_store import get_cash_balance, set_cash_balance
+        set_cash_balance(50_000.0, db)
+        ds.open_position(position_id="R_1", symbol="R", stock_purchase_price=100.0, shares=100,
+                         call_strike=105.0, call_premium=2.0, call_expiration="2026-07-28", db_path=db)
+        ds.expire_option(position_id="R_1", db_path=db)        # call gone; premium 200 realized
+        cash_before = get_cash_balance(db)
+        # Rolling now (no active call) must NOT book a buyback — only the new call.
+        res = ds.roll_position(position_id="R_1", call_buyback_price=1.50, new_call_strike=95.0,
+                               new_call_premium=1.00, new_call_expiration="2026-08-21", db_path=db)
+        conn = ds._connect(db)
+        n_btc = conn.execute("SELECT COUNT(*) FROM transactions WHERE position_id='R_1' "
+                             "AND action='BUY_TO_CLOSE'").fetchone()[0]
+        conn.close()
+        assert n_btc == 1                                      # only the expire BTC; no phantom
+        assert get_cash_balance(db) == cash_before + 100.0     # +new premium only (no -150 buyback)
+        assert res["total_realized_pnl"] == 300.0              # 200 + 100 new premium
     finally:
         os.path.exists(db) and os.unlink(db)
 

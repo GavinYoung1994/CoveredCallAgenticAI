@@ -57,6 +57,24 @@ def test_holdings_api_returns_positions():
     assert d["positions"][0]["symbol"] == "KO" and d["positions"][0]["short_call_strike"] == 62.5
 
 
+def test_transactions_window_served():
+    r = _app().get("/transactions")
+    assert r.status_code == 200 and b"Transaction History" in r.data
+
+
+def test_transactions_api_returns_ledger():
+    provider = lambda: {"transactions": [
+        {"transaction_id": "KO_1_OPT", "timestamp": "2026-07-01 12:00:00", "symbol": "KO",
+         "position_id": "KO_1", "asset_type": "OPTION", "action": "SELL_TO_OPEN",
+         "quantity": 1, "price": 1.2, "fees": 0.0, "strike_price": 62.5,
+         "expiration_date": "2026-07-28", "cash_effect": 120.0}]}
+    client = create_app(agent_provider=lambda: FakeAgent(), runners={},
+                        transactions_provider=provider, log_buffer=LogBuffer(), run_async=False).test_client()
+    d = client.get("/api/transactions").get_json()
+    assert d["transactions"][0]["symbol"] == "KO"
+    assert d["transactions"][0]["cash_effect"] == 120.0
+
+
 def test_static_css_served():
     r = _app().get("/static/styles.css")
     assert r.status_code == 200

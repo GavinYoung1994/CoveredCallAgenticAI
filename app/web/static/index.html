@@ -66,6 +66,11 @@ function Sidebar({ theme, setTheme }) {
           <span className="ic">📁</span>
           <span>My Holdings<small>Positions &amp; covered-call contracts ↗</small></span>
         </button>
+        <button className="wf-btn"
+                onClick={() => window.open("/transactions", "transactions", "width=1100,height=720,menubar=no,toolbar=no")}>
+          <span className="ic">🧾</span>
+          <span>Transaction History<small>Every ledger transaction ↗</small></span>
+        </button>
       </div>
       <div>
         <div className="section-label">Workflows</div>

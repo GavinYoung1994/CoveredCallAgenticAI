@@ -178,6 +178,7 @@ class DefenseState(TypedDict, total=False):
     current_call_ask: float
     roll_down_premium: float
     breach_detected: bool
+    price_unavailable: bool           # quote fetch failed → breach could not be assessed
 
     branch_analysis: Dict[str, Any]   # ToT P&L for branches A/B/C (Quant)
     news_report: NewsReport           # News node's read on the position

@@ -183,6 +183,14 @@ def build_risk_manager_node(
         scored.sort(key=lambda t: t[0], reverse=True)
         top = [rec for _, rec in scored[: rules.top_n_candidates]]
 
+        # Record candidates that passed every filter + the yield gate but ranked
+        # beyond top-N — otherwise they'd vanish from the audit trail (the "no
+        # silent truncation" invariant Quant/News also uphold).
+        for _, rec in scored[rules.top_n_candidates:]:
+            rejections.append(reject(rec["symbol"], "RISK_MANAGER",
+                f"Passed all gates (grade {rec.get('grade')}, score {rec.get('score', 0):.0f}) but "
+                f"ranked outside the top {rules.top_n_candidates} this run."))
+
         all_rejected = (state.get("rejected") or []) + rejections
         out = {"recommendations": top, "rejected": rejections}
         out.update(_publish(top, state, all_rejected, notifier))

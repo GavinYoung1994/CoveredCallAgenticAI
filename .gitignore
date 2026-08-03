@@ -1,6 +1,7 @@
 # ── Secrets (NEVER commit these) ──────────────────────────────────────
 .env
 charles_schwab_mcp/schwab_tokens.json   # contains live access/refresh tokens
+charles_schwab_mcp/schwab_tokens*
 
 # ── Python ────────────────────────────────────────────────────────────
 __pycache__/
@@ -11,11 +12,13 @@ venv/
 
 # ── Large binaries ────────────────────────────────────────────────────
 model/*.gguf                             # the local LLM weights (multi-GB)
+model/
 
 # ── Databases (local state) — all persistence under app/memory/ ───────
 app/memory/sql/*.db
 *.sqlite3
 app/memory/chroma/                       # ChromaDB persistence dir
+app/memory/chroma*
 
 # ── OS / editor ───────────────────────────────────────────────────────
 .DS_Store

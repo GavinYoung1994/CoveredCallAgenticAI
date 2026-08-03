@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="midnight">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Transaction History</title>
+<link rel="stylesheet" href="/static/styles.css" />
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo } = React;
+document.documentElement.dataset.theme = localStorage.getItem("ccc-theme") || "midnight";
+
+const fmtMoney = (v) => v == null ? "—" : "$" + Number(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtSigned = (v) => v == null ? "—" : (v >= 0 ? "+" : "") + fmtMoney(v);
+const expOf = (s) => s ? String(s).split(":")[0] : null;
+const fmtWhen = (s) => {
+  if (!s) return "—";
+  const d = new Date(String(s).replace(" ", "T") + (String(s).endsWith("Z") ? "" : "Z"));
+  return isNaN(d) ? String(s) : d.toLocaleString(undefined, { year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+};
+// Human-friendly action labels + a CSS class for the pill color.
+const ACTIONS = {
+  BUY_TO_OPEN:  { label: "Buy to open",  cls: "buy" },
+  SELL_TO_OPEN: { label: "Sell to open", cls: "sell" },
+  BUY_TO_CLOSE: { label: "Buy to close", cls: "buy" },
+  SELL_TO_CLOSE:{ label: "Sell to close",cls: "sell" },
+};
+
+function Transactions() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [q, setQ] = useState("");
+  const [kind, setKind] = useState("ALL");   // ALL | STOCK | OPTION
+
+  async function load() {
+    setLoading(true); setErr(null);
+    try {
+      const r = await fetch("/api/transactions");
+      const d = await r.json();
+      if (d.error) setErr(d.error); else setData(d);
+    } catch (e) { setErr(String(e)); }
+    setLoading(false);
+  }
+  useEffect(() => { load(); }, []);
+
+  const all = data?.transactions || [];
+  const rows = useMemo(() => all.filter(t => {
+    if (kind !== "ALL" && t.asset_type !== kind) return false;
+    if (q) {
+      const hay = `${t.symbol||""} ${t.position_id||""} ${t.action||""}`.toLowerCase();
+      if (!hay.includes(q.toLowerCase())) return false;
+    }
+    return true;
+  }), [all, kind, q]);
+
+  // Summary over the FILTERED rows.
+  const netCash = rows.reduce((s, t) => s + (t.cash_effect || 0), 0);
+  const premiums = rows.filter(t => t.asset_type === "OPTION" && t.action === "SELL_TO_OPEN")
+    .reduce((s, t) => s + (t.price || 0) * (t.quantity || 0) * 100, 0);
+  const symbols = new Set(rows.map(t => t.symbol).filter(Boolean)).size;
+
+  return (
+    <div className="wf-window">
+      <div className="wf-top">
+        <div className="logo">🧾</div>
+        <div><h1>Transaction History</h1><p>Every buy, sell, premium &amp; buyback recorded in the ledger</p></div>
+        <button className="primary" style={{ marginLeft: "auto", height: 36 }} onClick={load}>↻ Refresh</button>
+      </div>
+
+      <div className="summary ok" style={{ display: "flex", gap: 28, flexWrap: "wrap" }}>
+        <div><b>Transactions</b><br />{rows.length}{rows.length !== all.length ? ` / ${all.length}` : ""}</div>
+        <div><b>Symbols</b><br />{symbols}</div>
+        <div><b>Premiums collected</b><br /><span style={{ color: "var(--green)" }}>{fmtMoney(premiums)}</span></div>
+        <div><b>Net cash flow</b><br /><span style={{ color: netCash >= 0 ? "var(--green)" : "var(--red)" }}>{fmtSigned(netCash)}</span></div>
+      </div>
+
+      <div style={{ display: "flex", gap: 10, alignItems: "center", margin: "4px 0 10px" }}>
+        <input placeholder="Filter by symbol, position, or action…" value={q}
+               onChange={e => setQ(e.target.value)}
+               style={{ flex: 1, minWidth: 200 }} />
+        {["ALL", "STOCK", "OPTION"].map(k => (
+          <button key={k} className={"pill " + (kind === k ? "open" : "")}
+                  style={{ cursor: "pointer", border: "none" }}
+                  onClick={() => setKind(k)}>{k === "ALL" ? "All" : k[0] + k.slice(1).toLowerCase()}</button>
+        ))}
+      </div>
+
+      <div className="log-list" style={{ background: "transparent", fontFamily: "inherit", fontSize: 13.5 }}>
+        {loading ? <div className="empty">Loading transactions…</div>
+          : err ? <div className="empty" style={{ color: "var(--red)" }}>⚠️ {err}</div>
+          : all.length === 0 ? <div className="empty">No transactions yet. Approve a screener candidate to open your first position.</div>
+          : rows.length === 0 ? <div className="empty">No transactions match this filter.</div>
+          : (
+            <table className="holdings-table">
+              <thead><tr>
+                <th>Date</th><th>Symbol</th><th>Action</th><th>Type</th>
+                <th style={{ textAlign: "right" }}>Qty</th><th style={{ textAlign: "right" }}>Price</th>
+                <th>Contract</th><th style={{ textAlign: "right" }}>Cash effect</th>
+              </tr></thead>
+              <tbody>
+                {rows.map(t => {
+                  const a = ACTIONS[t.action] || { label: t.action, cls: "" };
+                  return (
+                    <tr key={t.transaction_id}>
+                      <td>{fmtWhen(t.timestamp)}</td>
+                      <td><b>{t.symbol || "—"}</b><div className="muted">{t.position_id}</div></td>
+                      <td><span className={"pill " + a.cls}>{a.label}</span></td>
+                      <td>{t.asset_type === "OPTION" ? "Option" : "Stock"}</td>
+                      <td style={{ textAlign: "right" }}>{t.quantity}</td>
+                      <td style={{ textAlign: "right" }}>{fmtMoney(t.price)}</td>
+                      <td>{t.asset_type === "OPTION" && t.strike_price != null
+                            ? `${fmtMoney(t.strike_price)} call, exp ${expOf(t.expiration_date) || "—"}`
+                            : "—"}</td>
+                      <td style={{ textAlign: "right", color: (t.cash_effect || 0) >= 0 ? "var(--green)" : "var(--red)" }}>
+                        {fmtSigned(t.cash_effect)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+      </div>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<Transactions />);
+</script>
+</body>
+</html>

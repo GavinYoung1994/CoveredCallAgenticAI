@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from app.config import settings
-from app.data.rate_limiter import RateLimiter  # re-exported for back-compat
+from app.data.rate_limiter import RateLimiter, get_shared_limiter  # re-exported for back-compat
 
 logger = logging.getLogger("news-client")
 
@@ -57,9 +57,9 @@ class NewsClient:
         self._base_url = (base_url or settings.massive_api_base_url).rstrip("/")
         self._news_path = news_path or settings.massive_news_path
         self._client = http_client or httpx.Client(timeout=30.0)
-        self._limiter = rate_limiter or RateLimiter(
-            settings.massive_rate_limit_calls, settings.massive_rate_limit_period_sec
-        )
+        # Shared with every other massive.com client (one account quota).
+        self._limiter = rate_limiter or get_shared_limiter(
+            "massive", settings.massive_rate_limit_calls, settings.massive_rate_limit_period_sec)
         # Lower-cased publisher allow/block lists; empty allowlist = accept all.
         allow = allowed_publishers if allowed_publishers is not None else settings.news_allowed_publishers
         block = disallowed_publishers if disallowed_publishers is not None else settings.news_disallowed_publishers

@@ -139,10 +139,18 @@ def evaluate_news(llm: LocalLLM, symbol: str, headlines: List[Dict[str, Any]], r
 
 def _defer_beyond_cap(candidates: List[Dict[str, Any]], rules) -> tuple:
     """Cost control: news-screen only the top-N by annualized yield; record the
-    rest as deferred rejections (no silent truncation). Returns (to_screen, rejections)."""
+    rest as deferred rejections (no silent truncation). Returns (to_screen, rejections).
+
+    Ranks by the SAME yield metric the Risk Manager's >10% gate uses
+    (``yield_target_metric``) so we never defer the candidate the gate would rank
+    highest — e.g. under the default "flat" metric, a high flat-AROC name must not
+    be dropped in favor of one with a high assigned-AROC but low flat yield.
+    """
+    metric_key = ("aroc_if_flat_percent" if getattr(rules, "yield_target_metric", "flat") == "flat"
+                  else "aroc_if_assigned_percent")
     ranked = sorted(
         candidates,
-        key=lambda c: c.get("yield_metrics", {}).get("aroc_if_assigned_percent", 0.0),
+        key=lambda c: c.get("yield_metrics", {}).get(metric_key, 0.0),
         reverse=True,
     )
     to_screen = ranked[: rules.news_max_candidates]

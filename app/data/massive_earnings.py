@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from app.config import settings
-from app.data.rate_limiter import RateLimiter
+from app.data.rate_limiter import RateLimiter, get_shared_limiter
 
 logger = logging.getLogger("massive-earnings")
 
@@ -35,11 +35,9 @@ class MassiveEarningsClient:
         self._base_url = (base_url or settings.massive_api_base_url).rstrip("/")
         self._path = path
         self._client = http_client or httpx.Client(timeout=30.0)
-        self._limiter = rate_limiter or RateLimiter(
-            settings.massive_rate_limit_calls,
-            settings.massive_rate_limit_period_sec,
-            name="massive-earnings",
-        )
+        # Shared with every other massive.com client (one account quota).
+        self._limiter = rate_limiter or get_shared_limiter(
+            "massive", settings.massive_rate_limit_calls, settings.massive_rate_limit_period_sec)
 
     @property
     def enabled(self) -> bool:

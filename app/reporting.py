@@ -29,7 +29,10 @@ logger = logging.getLogger("reporting")
 
 def gather_performance(db_path: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
     """Aggregate the SQL ledger into a performance stats dict (deterministic)."""
-    conn = sqlite3.connect(str(db_path or settings.sql_db_path))
+    # Use the schema-applying connection so a report on a fresh/empty ledger
+    # (before any trade) returns zeros instead of "no such table".
+    from app.memory.decision_store import _connect
+    conn = _connect(db_path or settings.sql_db_path)
     conn.row_factory = sqlite3.Row
     try:
         def scalar(sql: str, default=0):

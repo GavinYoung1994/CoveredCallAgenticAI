@@ -27,7 +27,7 @@ from typing import Any, Callable, Dict, List, Optional
 import httpx
 
 from app.config import settings
-from app.data.rate_limiter import RateLimiter
+from app.data.rate_limiter import RateLimiter, get_shared_limiter
 
 logger = logging.getLogger("massive-client")
 
@@ -51,12 +51,11 @@ class MassiveClient:
         self._api_key = api_key if api_key is not None else settings.massive_api_key
         self._base_url = (base_url or settings.massive_api_base_url).rstrip("/")
         self._client = http_client or httpx.Client(timeout=30.0)
-        # Reuse the same free-tier limiter config as the news client (5/min).
-        self._limiter = rate_limiter or RateLimiter(
-            settings.massive_rate_limit_calls,
-            settings.massive_rate_limit_period_sec,
-            name="massive",
-        )
+        # Share ONE limiter across all massive.com clients — they hit the same
+        # account/quota, so separate limiters would let the combined rate exceed
+        # the cap. Tests may inject their own.
+        self._limiter = rate_limiter or get_shared_limiter(
+            "massive", settings.massive_rate_limit_calls, settings.massive_rate_limit_period_sec)
         # Injectable "today" so option DTEs are deterministic in tests.
         self._clock = clock or date.today
 
@@ -219,16 +218,28 @@ class MassiveClient:
             params["strike_price"] = strike
 
         results: List[Dict[str, Any]] = []
-        path = f"/v3/snapshot/options/{symbol.upper()}"
+        path: Optional[str] = f"/v3/snapshot/options/{symbol.upper()}"
         pages = 0
         while path and pages < settings.massive_option_chain_max_pages:
-            data = self._get(path, params=params if pages == 0 else None)
+            try:
+                data = self._get(path, params=params if pages == 0 else None)
+            except Exception as exc:  # noqa: BLE001 — keep whatever pages we already have
+                logger.warning("Option-chain page %d failed for %s (%s); using %d contracts so far.",
+                               pages, symbol.upper(), exc, len(results))
+                break
             results.extend(data.get("results") or [])
             nxt = data.get("next_url")
             if not nxt:
                 break
-            # next_url is absolute; strip the base so _get can re-add it + auth.
-            path = nxt[len(self._base_url):] if nxt.startswith(self._base_url) else nxt
+            # next_url is an absolute URL (its host may differ from our base, e.g.
+            # a Polygon-canonical host). Take ITS path+query verbatim so we never
+            # concatenate two absolute URLs. _get re-adds the base + auth.
+            try:
+                u = httpx.URL(nxt)
+                path = u.raw_path.decode() if hasattr(u.raw_path, "decode") else str(u.raw_path)
+            except Exception:  # noqa: BLE001
+                logger.warning("Unparseable next_url for %s; stopping pagination.", symbol.upper())
+                break
             params = {}
             pages += 1
 
