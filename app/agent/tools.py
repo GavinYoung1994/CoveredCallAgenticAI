@@ -72,9 +72,11 @@ _CLIENTS: Dict[str, Any] = {}
 
 
 def _schwab() -> Any:
+    # Name kept for back-compat; returns the configured market-data client
+    # (Massive by default, Schwab when MARKET_DATA_PROVIDER=schwab).
     if "schwab" not in _CLIENTS:
-        from app.data.schwab_client import SchwabClient
-        _CLIENTS["schwab"] = SchwabClient()
+        from app.data.market_data import get_market_data_client
+        _CLIENTS["schwab"] = get_market_data_client()
     return _CLIENTS["schwab"]
 
 
@@ -89,7 +91,9 @@ def _earnings() -> Any:
     if "earnings" not in _CLIENTS:
         from app.data.earnings_client import EarningsClient
         from app.data.earnings_search import CompositeEarningsClient, EarningsSearchClient
-        _CLIENTS["earnings"] = CompositeEarningsClient([EarningsClient(), EarningsSearchClient()])
+        from app.data.massive_earnings import MassiveEarningsClient
+        _CLIENTS["earnings"] = CompositeEarningsClient(
+            [EarningsClient(), MassiveEarningsClient(), EarningsSearchClient()])
     return _CLIENTS["earnings"]
 
 
@@ -147,6 +151,18 @@ def _next_earnings(symbol: str) -> Dict[str, Any]:
     d = _earnings().get_next_earnings_date(symbol, today.isoformat(),
                                            (today + timedelta(days=90)).isoformat())
     return {"symbol": symbol.upper(), "next_earnings_date": d}
+
+
+def _indicator(method: str, symbol: str, **kwargs) -> Dict[str, Any]:
+    """Call a technical-indicator method on the market-data client. These are
+    Massive endpoints; if the active provider (e.g. Schwab) lacks them, return a
+    clear message instead of crashing."""
+    client = _schwab()
+    fn = getattr(client, method, None)
+    if fn is None:
+        return {"error": f"{method} is not available for the current market-data provider "
+                         f"(set MARKET_DATA_PROVIDER=massive to enable indicator endpoints)."}
+    return fn(symbol, **kwargs)
 
 
 # ── workflow handlers (heavy: live data + LLM; run the full LangGraphs) ──
@@ -330,8 +346,20 @@ def _data_tools() -> List[Tool]:
              _obj({"symbol": _STR, "limit": _INT}, ["symbol"]),
              lambda symbol, limit=8: {"headlines": _news().get_headlines(symbol, limit=limit, fetch_content=False)}),
         Tool("get_next_earnings_date",
-             "Next earnings date for a symbol (Finnhub, then Google-search fallback).",
+             "Next earnings date for a symbol (Massive/Benzinga, then Finnhub, then Google-search).",
              _obj({"symbol": _STR}, ["symbol"]), _next_earnings),
+        Tool("get_sma", "Simple Moving Average from the market-data provider (default 50-day, daily).",
+             _obj({"symbol": _STR, "window": _INT}, ["symbol"]),
+             lambda symbol, window=50: _indicator("get_sma", symbol, window=window)),
+        Tool("get_ema", "Exponential Moving Average (default 50-day, daily).",
+             _obj({"symbol": _STR, "window": _INT}, ["symbol"]),
+             lambda symbol, window=50: _indicator("get_ema", symbol, window=window)),
+        Tool("get_rsi", "Relative Strength Index (default 14-period). >70 overbought, <30 oversold.",
+             _obj({"symbol": _STR, "window": _INT}, ["symbol"]),
+             lambda symbol, window=14: _indicator("get_rsi", symbol, window=window)),
+        Tool("get_macd", "MACD momentum (12/26/9). Returns the latest MACD/signal/histogram values.",
+             _obj({"symbol": _STR}, ["symbol"]),
+             lambda symbol: _indicator("get_macd", symbol)),
     ]
 
 

@@ -23,6 +23,8 @@ from app.config import settings
 from app.logging_config import setup_logging
 from app.data.earnings_client import EarningsClient
 from app.data.earnings_search import EarningsSearchClient, CompositeEarningsClient
+from app.data.massive_earnings import MassiveEarningsClient
+from app.data.market_data import get_market_data_client
 from app.data.news_client import NewsClient
 from app.data.schwab_client import SchwabClient
 from app.llm import LocalLLM, get_llm
@@ -92,13 +94,14 @@ def run_entry_screener(
     symbols = watchlist if watchlist is not None else load_watchlist()
     cash = account_cash if account_cash is not None else get_cash_balance()
 
-    schwab_client = schwab_client or SchwabClient()
+    schwab_client = schwab_client or get_market_data_client()
     news_client = news_client or NewsClient()
     llm = llm or get_llm()
     if earnings_client is None:
-        # Structured Finnhub first; fall back to the Google-search engine (which
-        # uses the LLM to disambiguate the date) when Finnhub returns nothing.
-        providers = [EarningsClient()]
+        # Finnhub first (free, working), then Massive/Benzinga (only reached if
+        # Finnhub misses — avoids a guaranteed 403 when Benzinga isn't entitled),
+        # then the Google-search LLM engine as a last resort.
+        providers = [EarningsClient(), MassiveEarningsClient()]
         if settings.earnings_search_enabled:
             providers.append(EarningsSearchClient(llm=llm))
         earnings_client = CompositeEarningsClient(providers)

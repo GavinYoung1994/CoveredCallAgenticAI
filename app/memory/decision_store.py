@@ -247,6 +247,22 @@ def expire_option(
                            (position_id,)).fetchone()
         if row is None:
             raise ValueError(f"Position {position_id} not found.")
+        # Idempotency guard: only expire if there is actually an OPEN short call
+        # (# SELL_TO_OPEN > # BUY_TO_CLOSE). Without this, calling "expire" twice
+        # would append meaningless BUY_TO_CLOSE @ $0 legs and corrupt the ledger.
+        n_sto = int(conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
+            "AND action = 'SELL_TO_OPEN'", (position_id,)).fetchone()[0] or 0)
+        n_btc = int(conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
+            "AND action = 'BUY_TO_CLOSE'", (position_id,)).fetchone()[0] or 0)
+        if n_sto <= n_btc:
+            realized = _realized_option_pnl(conn, position_id)
+            logger.info("Expire no-op on %s: no active short call to expire "
+                        "(already closed). Realized P&L unchanged at $%.2f.", position_id, realized)
+            return {"position_id": position_id, "status": row["status"], "shares_retained": True,
+                    "total_realized_pnl": realized, "action": "NO_ACTIVE_CALL",
+                    "note": "No active covered call to expire; nothing changed."}
         # Size the expiration to the currently-open short call.
         open_call = conn.execute(
             "SELECT quantity FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
@@ -314,10 +330,23 @@ def close_position(
                 "AND asset_type = 'STOCK' AND action = 'BUY_TO_OPEN'", (position_id,)).fetchone()
             shares = int(sh[0] or 0)
 
+        # Only buy back the short call if one is actually OPEN. Guards against a
+        # phantom buyback (double-count / cash error) when closing a position
+        # whose call already expired or was rolled away.
         if call_buyback_price is not None:
-            add_transaction(conn, transaction_id=f"{position_id}_BTC", position_id=position_id,
-                            asset_type="OPTION", action="BUY_TO_CLOSE", quantity=contracts,
-                            price=call_buyback_price, fees=fees)
+            n_sto = int(conn.execute(
+                "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
+                "AND action = 'SELL_TO_OPEN'", (position_id,)).fetchone()[0] or 0)
+            n_btc = int(conn.execute(
+                "SELECT COUNT(*) FROM transactions WHERE position_id = ? AND asset_type = 'OPTION' "
+                "AND action = 'BUY_TO_CLOSE'", (position_id,)).fetchone()[0] or 0)
+            if n_sto > n_btc:
+                add_transaction(conn, transaction_id=f"{position_id}_BTC", position_id=position_id,
+                                asset_type="OPTION", action="BUY_TO_CLOSE", quantity=contracts,
+                                price=call_buyback_price, fees=fees)
+            else:
+                logger.info("Ignoring call_buyback_price for %s: no active short call to close.",
+                            position_id)
         if stock_sale_price is not None and shares:
             add_transaction(conn, transaction_id=f"{position_id}_STC", position_id=position_id,
                             asset_type="STOCK", action="SELL_TO_CLOSE", quantity=shares,

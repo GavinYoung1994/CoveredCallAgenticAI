@@ -20,11 +20,14 @@ cp .env.example .env          # then fill in real values (see below)
 ### Required `.env` values
 | Variable | Needed for | How to get it |
 |---|---|---|
-| `SCHWAB_APP_KEY` / `SCHWAB_APP_SECRET` | Prices & option chains | Schwab developer portal (see §2) |
-| `SCHWAB_REDIRECT_URI` | OAuth | Must match the redirect registered on your Schwab app |
-| `MASSIVE_API_KEY` | News sentiment | massive.com account |
-| `FINNHUB_API_KEY` | Earnings guardrail | finnhub.io free key (optional — without it, earnings is "unknown → flagged") |
+| `MASSIVE_API_KEY` | **Prices, option chains, history, indicators & news** (default provider) | massive.com account (needs the Stocks + Options plans for chains/greeks) |
+| `MARKET_DATA_PROVIDER` | Which market-data client to use: `massive` (default) or `schwab` | optional — defaults to `massive` |
+| `SCHWAB_APP_KEY` / `SCHWAB_APP_SECRET` | Prices & option chains **only if** `MARKET_DATA_PROVIDER=schwab` | Schwab developer portal (see §2) |
+| `SCHWAB_REDIRECT_URI` | OAuth (Schwab provider only) | Must match the redirect registered on your Schwab app |
+| `FINNHUB_API_KEY` | Earnings guardrail (primary) | finnhub.io free key (optional — without it, earnings falls back to Google-search, then "unknown → flagged") |
 | `DISCORD_WEBHOOK_URL` | HITL alerts | Discord → Server Settings → Integrations → Webhooks |
+
+> **Market-data provider:** the system defaults to **massive.com** (Polygon-compatible) for prices, option chains, historical bars, and technical indicators. Schwab remains available as a drop-in fallback via `MARKET_DATA_PROVIDER=schwab` (requires the OAuth setup in §2). Earnings uses Finnhub first, then Massive/Benzinga (if entitled), then a Google-search LLM engine.
 
 The local LLM (`model/qwen2.5-coder-14b-instruct-q4_k_m.gguf`) and `LLM_*` settings are
 already wired; install `llama-cpp-python` (in requirements) and it loads on first use.

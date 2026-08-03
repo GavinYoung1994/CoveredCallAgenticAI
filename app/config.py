@@ -63,12 +63,13 @@ class Settings:
     massive_news_path: str = field(
         default_factory=lambda: _get("MASSIVE_NEWS_PATH", "/v2/reference/news")
     )
-    # Free tier = 5 requests/minute. The news client enforces this.
+    # Paid plan: 30 requests / 10 seconds (sliding window). Enforced by every
+    # Massive client — news, market data, and earnings.
     massive_rate_limit_calls: int = field(
-        default_factory=lambda: int(_get("MASSIVE_RATE_LIMIT_CALLS", "5"))
+        default_factory=lambda: int(_get("MASSIVE_RATE_LIMIT_CALLS", "30"))
     )
     massive_rate_limit_period_sec: float = field(
-        default_factory=lambda: float(_get("MASSIVE_RATE_LIMIT_PERIOD_SEC", "60"))
+        default_factory=lambda: float(_get("MASSIVE_RATE_LIMIT_PERIOD_SEC", "10"))
     )
     # Optional publisher allowlist (comma-separated, case-insensitive substring
     # match against each article's publisher name). Empty = accept all sources.
@@ -156,6 +157,23 @@ class Settings:
     # How many symbols to request per batched /quotes call.
     schwab_quote_batch_size: int = field(
         default_factory=lambda: int(_get("SCHWAB_QUOTE_BATCH_SIZE", "25"))
+    )
+
+    # ── Market-data provider selection ────────────────────────────────
+    # Which client the screener/defense graphs use for prices, option chains,
+    # history, indicators, and earnings. "massive" (Polygon-compatible, stable)
+    # is the default; "schwab" falls back to the legacy OAuth client.
+    market_data_provider: str = field(
+        default_factory=lambda: _get("MARKET_DATA_PROVIDER", "massive").strip().lower()
+    )
+    # Massive stocks/options REST (Polygon-compatible). Reuses MASSIVE_API_KEY +
+    # MASSIVE_API_BASE_URL (already defined above for news). Endpoint paths are
+    # configurable so a Polygon base can be swapped in unchanged.
+    massive_quote_batch_size: int = field(
+        default_factory=lambda: int(_get("MASSIVE_QUOTE_BATCH_SIZE", "50"))
+    )
+    massive_option_chain_max_pages: int = field(
+        default_factory=lambda: int(_get("MASSIVE_OPTION_CHAIN_MAX_PAGES", "6"))
     )
 
     # Discord HITL webhook

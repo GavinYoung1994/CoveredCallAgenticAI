@@ -23,6 +23,8 @@ from app.data.news_client import NewsClient
 from app.data.schwab_client import SchwabClient
 from app.data.earnings_client import EarningsClient
 from app.data.earnings_search import EarningsSearchClient, CompositeEarningsClient
+from app.data.massive_earnings import MassiveEarningsClient
+from app.data.market_data import get_market_data_client
 from app.llm import LocalLLM, get_llm
 from app.nodes.defense import (
     build_defense_quant_node,
@@ -41,9 +43,10 @@ def _route_after_quant(state: DefenseState) -> str:
 
 
 def _default_earnings_client(llm: LocalLLM):
-    """Composite next-earnings provider (Finnhub → Google+LLM search), same as
-    the entry screener uses. Best-effort; the roll guardrail degrades to no cap."""
-    providers = [EarningsClient()]
+    """Composite next-earnings provider (Massive/Benzinga → Finnhub → Google+LLM
+    search), same as the entry screener uses. Best-effort; the roll guardrail
+    degrades to no cap if all providers return nothing."""
+    providers = [EarningsClient(), MassiveEarningsClient()]
     if settings.earnings_search_enabled:
         providers.append(EarningsSearchClient(llm=llm))
     return CompositeEarningsClient(providers)
@@ -101,7 +104,7 @@ def run_defense_monitor(
     now = datetime.now(timezone.utc)
     run_id = run_id or f"defense_{position.get('symbol','?')}_{now.strftime('%Y%m%d_%H%M%S')}"
 
-    schwab_client = schwab_client or SchwabClient()
+    schwab_client = schwab_client or get_market_data_client()
     news_client = news_client or NewsClient()
     llm = llm or get_llm()
     notifier = notifier if notifier is not None else DiscordNotifier()
@@ -153,7 +156,7 @@ def run_defense_scan(
     now = datetime.now(timezone.utc)
     run_timestamp = run_timestamp or now.isoformat()
 
-    schwab_client = schwab_client or SchwabClient()
+    schwab_client = schwab_client or get_market_data_client()
     news_client = news_client or NewsClient()
     llm = llm or get_llm()
     notifier = notifier if notifier is not None else DiscordNotifier()

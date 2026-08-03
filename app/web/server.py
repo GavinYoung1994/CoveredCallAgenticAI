@@ -163,13 +163,14 @@ def launch_workflow(jobs: "Jobs", runners: Dict[str, Callable[[], Any]], name: s
 
 
 def _live_price_provider(symbols):
-    """Fetch current market prices {symbol: last_price} via Schwab. Best-effort:
-    any failure yields an empty map so the holdings view still renders."""
+    """Fetch current market prices {symbol: last_price} via the configured
+    market-data provider (Massive by default). Best-effort: any failure yields an
+    empty map so the holdings view still renders."""
     if not symbols:
         return {}
     try:
-        from app.data.schwab_client import SchwabClient
-        client = SchwabClient()
+        from app.data.market_data import get_market_data_client
+        client = get_market_data_client()
         quotes = client.get_quotes_chunked(list(symbols))
         out = {}
         for sym in symbols:

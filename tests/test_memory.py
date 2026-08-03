@@ -316,6 +316,47 @@ def test_expire_option_keeps_shares_realizes_premium():
         os.path.exists(db) and os.unlink(db)
 
 
+def test_expire_option_is_idempotent():
+    db = _tmp_db()
+    try:
+        import sqlite3
+        from app.memory.decision_store import _connect
+        ds.open_position(position_id="X_1", symbol="X", stock_purchase_price=100.0, shares=100,
+                         call_strike=105.0, call_premium=2.0, call_expiration="2026-07-28", db_path=db)
+        first = ds.expire_option(position_id="X_1", db_path=db)
+        assert first["total_realized_pnl"] == 200.0 and first["action"] == "OPTION_EXPIRED"
+        # Expiring again must be a NO-OP: no extra BUY_TO_CLOSE legs, realized unchanged.
+        second = ds.expire_option(position_id="X_1", db_path=db)
+        assert second["action"] == "NO_ACTIVE_CALL"
+        assert second["total_realized_pnl"] == 200.0
+        conn = _connect(db)
+        n_btc = conn.execute("SELECT COUNT(*) FROM transactions WHERE position_id='X_1' "
+                             "AND asset_type='OPTION' AND action='BUY_TO_CLOSE'").fetchone()[0]
+        conn.close()
+        assert n_btc == 1   # exactly one expiration leg, not two
+    finally:
+        os.path.exists(db) and os.unlink(db)
+
+
+def test_premium_not_double_counted_when_stock_sold_after_expiry():
+    db = _tmp_db()
+    try:
+        from app.memory.positions_store import list_holdings_detailed
+        ds.open_position(position_id="X_1", symbol="X", stock_purchase_price=100.0, shares=100,
+                         call_strike=105.0, call_premium=2.0, call_expiration="2026-07-28", db_path=db)
+        ds.expire_option(position_id="X_1", db_path=db)          # premium 200 realized, shares held
+        # Later, sell the shares on the market at 108 (LIQUIDATED). Even if a stray
+        # call_buyback_price is passed, no phantom buyback is added.
+        res = ds.close_position(position_id="X_1", status="LIQUIDATED", stock_sale_price=108.0,
+                                call_buyback_price=1.0, db_path=db)
+        # Realized = premium 200 (once) + stock gain (108-100)*100 = 800 → 1000.
+        assert res["total_realized_pnl"] == 1000.0
+        h = next(x for x in list_holdings_detailed(db_path=db) if x["position_id"] == "X_1")
+        assert h["total_realized_pnl"] == 1000.0
+    finally:
+        os.path.exists(db) and os.unlink(db)
+
+
 def test_expired_via_management_service_does_not_sell_stock():
     db = _tmp_db()
     try:

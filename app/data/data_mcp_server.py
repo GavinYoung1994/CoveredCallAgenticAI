@@ -33,8 +33,13 @@ mcp = FastMCP("Covered Call Data APIs")
 _clients: Dict[str, Any] = {}
 
 
-def _schwab() -> SchwabClient:
-    return _clients.setdefault("schwab", SchwabClient())
+def _schwab():
+    # Configured market-data client (Massive by default, Schwab when
+    # MARKET_DATA_PROVIDER=schwab). Name kept for back-compat.
+    if "schwab" not in _clients:
+        from app.data.market_data import get_market_data_client
+        _clients["schwab"] = get_market_data_client()
+    return _clients["schwab"]
 
 
 def _news() -> NewsClient:
