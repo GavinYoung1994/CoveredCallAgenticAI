@@ -62,10 +62,17 @@ Hard rules:
 - To CHANGE anything (record/execute a trade, update a holding, set cash, close/roll a position) you
   MUST call the tool that performs it. NEVER say a change was made unless a tool you called RETURNED a
   successful result — claiming an un-performed action is a critical failure.
-- When the user says holdings were executed / assigned / called away / sold, call
-  `update_holding_status` for EACH holding (one call per symbol, status ASSIGNED unless told
-  otherwise), then report the ACTUAL results the tool returned.
+- When the user says a holding was executed/closed, call `update_holding_status` (one call per
+  symbol) and pick the status by WHAT HAPPENED — do NOT default to ASSIGNED:
+    • "sold" / "sell my stock" / sold on the market → LIQUIDATED (records the CURRENT market
+      price automatically; this can be a loss — never substitute the strike),
+    • "called away" / "assigned" / "exercised" → ASSIGNED (sold at the strike),
+    • call "expired" worthless (shares kept) → EXPIRED.
+  Then report the ACTUAL results the tool returned.
 - Use one tool at a time; read its result before deciding the next step.
+- STOP when the task is done. Once a change tool returns success (or `already_done: true`), do
+  NOT call it again — the change is persisted. You may verify ONCE with `list_holdings`, then
+  give your final answer. Never alternate update→list→update on the same holding.
 - Be concise and decision-useful. Explain reasoning, surface risks, and cite the numbers tools return.
 
 Respond with a SINGLE JSON object each turn:
@@ -116,6 +123,8 @@ class CoveredCallAgent:
         steps: List[Dict[str, Any]] = []
         scratch = ""
         corrected = False
+        call_counts: Dict[str, int] = {}       # (tool,args) signature → times issued
+        succeeded_mut: set = set()             # signatures of successful mutating calls
 
         for i in range(self.max_steps):
             user = self._build_prompt(message, history, scratch)
@@ -141,13 +150,32 @@ class CoveredCallAgent:
 
             tool_name = obj.get("tool")
             args = obj.get("args", {}) or {}
-            if tool_name not in self.tools:
+            sig = f"{tool_name}:{json.dumps(args, sort_keys=True, default=str)}"
+
+            # ── Loop-breakers (deterministic — don't depend on the model behaving) ──
+            if tool_name in _MUTATING_TOOLS and sig in succeeded_mut:
+                # Re-issuing an already-succeeded change → it's persisted; stop redoing it.
+                obs = {"already_done": True,
+                       "note": f"{tool_name} with these args already succeeded this turn; the change "
+                               f"is recorded. Do NOT repeat it — give your final answer now."}
+            elif call_counts.get(sig, 0) >= 1:
+                # Same exact call a 3rd time (issued twice already) → we're looping.
+                obs = {"loop_detected": True,
+                       "note": "You already made this exact call; the state is already as needed. "
+                               "Stop calling tools and provide your final answer to the user now."}
+            elif tool_name not in self.tools:
                 obs = {"error": f"unknown tool '{tool_name}'", "available": list(self.tools)}
             else:
                 try:
                     obs = self.tools[tool_name].run(**self._filter_args(self.tools[tool_name], args))
                 except Exception as exc:  # noqa: BLE001
                     obs = {"error": str(exc)}
+                # Track a genuine successful mutation so a later repeat short-circuits.
+                if tool_name in _MUTATING_TOOLS and not (
+                        isinstance(obs, dict) and (obs.get("error") or obs.get("updated") is False)):
+                    succeeded_mut.add(sig)
+
+            call_counts[sig] = call_counts.get(sig, 0) + 1
             steps.append({"tool": tool_name, "args": args, "observation": obs})
             logger.info("Agent step %d: %s(%s)", i + 1, tool_name, json.dumps(args, default=str))
             scratch += (f"\nAction: {tool_name}({json.dumps(args, default=str)})"

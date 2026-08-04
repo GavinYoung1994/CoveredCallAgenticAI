@@ -94,6 +94,15 @@ class ManagementService:
         pid = pos["position_id"]
         contracts = contracts or pos.get("contracts") or 1
 
+        # Idempotency: if the position is already closed (no OPEN row resolved),
+        # re-applying a closing status is a NO-OP — return a clear "already done"
+        # result instead of erroring on duplicate legs. Prevents an agent from
+        # looping (update → verify → update …) after the first success.
+        if status in _CLOSING_STATUSES and pos.get("status") not in (None, "OPEN"):
+            return {"position_id": pid, "status": pos["status"], "already_done": True,
+                    "total_realized_pnl": pos.get("total_realized_pnl"),
+                    "note": f"{pos['symbol']} is already {pos['status']} — no change needed."}
+
         # EXPIRED = the CALL expired worthless. Keep the premium as realized gain,
         # RETAIN the shares — never sell stock here. Only ASSIGNED/LIQUIDATED sell.
         if status == "EXPIRED":

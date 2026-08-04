@@ -128,11 +128,20 @@ class LocalLLM:
             return self._backend(msgs)
         self._ensure_loaded()
         assert self._llm is not None
-        result = self._llm.create_chat_completion(
-            messages=msgs,
-            temperature=self.temperature if temperature is None else temperature,
-            max_tokens=max_tokens,
-        )
+        try:
+            result = self._llm.create_chat_completion(
+                messages=msgs,
+                temperature=self.temperature if temperature is None else temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception:
+            # A fatal decode error (e.g. `llama_decode returned -3`) can leave the
+            # shared KV cache in a bad state, breaking every later call until the
+            # server restarts. Drop the model so the NEXT call reloads it fresh and
+            # the agent self-heals; re-raise so this call still surfaces the error.
+            logger.exception("LLM completion failed; resetting the model for a fresh reload.")
+            self._llm = None
+            raise
         return result["choices"][0]["message"]["content"] or ""
 
     def chat(self, system: str, user: str, **kwargs: Any) -> str:

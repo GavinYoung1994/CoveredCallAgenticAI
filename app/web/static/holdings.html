@@ -19,10 +19,60 @@ const fmtMoney = (v) => v == null ? "—" : "$" + Number(v).toLocaleString(undef
 const fmtPct = (v) => v == null ? "—" : Number(v).toFixed(1) + "%";
 const expOf = (s) => s ? String(s).split(":")[0] : "—";
 
+function PositionsTable({ rows }) {
+  return (
+    <table className="holdings-table">
+      <thead><tr>
+        <th>Symbol</th><th>Status</th><th>Shares</th><th>Cost basis</th>
+        <th>Current price</th><th>Short call</th><th>Expiration</th><th>Premium</th><th>Buffer</th>
+        <th>Realized P&amp;L</th><th>Annualized</th>
+      </tr></thead>
+      <tbody>
+        {rows.map(p => (
+          <tr key={p.position_id}>
+            <td><b>{p.symbol}</b><div className="muted">{p.position_id}</div></td>
+            <td><span className={"pill " + (p.status === "OPEN" ? "open" : "closed")}>{p.status}</span></td>
+            <td>{p.shares}</td>
+            <td>{fmtMoney(p.stock_purchase_price)}</td>
+            <td>
+              {p.current_price == null ? "—" : fmtMoney(p.current_price)}
+              {p.unrealized_stock_pnl != null
+                ? <div className="muted" style={{ color: p.unrealized_stock_pnl >= 0 ? "var(--green)" : "var(--red)" }}>
+                    {(p.unrealized_stock_pnl >= 0 ? "+" : "") + fmtMoney(p.unrealized_stock_pnl)} unrl.
+                  </div>
+                : null}
+            </td>
+            <td>
+              {p.short_call_strike != null ? fmtMoney(p.short_call_strike) + " call" : "—"}{p.contracts ? ` ×${p.contracts}` : ""}
+              {(p.status === "OPEN" && p.has_active_call === false)
+                ? <div className="muted">call expired — shares held</div> : null}
+            </td>
+            <td>{expOf(p.short_call_expiration)}</td>
+            <td>{p.short_call_premium != null ? fmtMoney(p.short_call_premium) : "—"}</td>
+            <td>{fmtPct(p.downside_buffer_percent)}</td>
+            <td style={{ color: (p.total_realized_pnl || 0) > 0 ? "var(--green)" : (p.total_realized_pnl || 0) < 0 ? "var(--red)" : "inherit" }}>
+              {(p.status === "OPEN" && !p.total_realized_pnl) ? "—" : fmtMoney(p.total_realized_pnl)}
+              {(p.status === "OPEN" && p.total_realized_pnl)
+                ? <div className="muted">{p.has_active_call === false ? "premium (call expired)" : "premium collected"}</div>
+                : null}</td>
+            <td title={p.return_basis ? `${fmtPct(p.return_percent)} over ${p.days_held}d (${p.return_basis})` : ""}
+                style={{ color: (p.annualized_return_percent || 0) > 0 ? "var(--green)" : (p.annualized_return_percent || 0) < 0 ? "var(--red)" : "inherit" }}>
+              {p.annualized_return_percent == null ? "—" : fmtPct(p.annualized_return_percent)}
+              {p.status === "OPEN" && p.annualized_return_percent != null
+                ? <div className="muted">premium</div> : null}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 function Holdings() {
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [showClosed, setShowClosed] = useState(false);
 
   async function load() {
     setLoading(true); setErr(null);
@@ -37,6 +87,7 @@ function Holdings() {
 
   const positions = data?.positions || [];
   const open = positions.filter(p => p.status === "OPEN");
+  const closed = positions.filter(p => p.status !== "OPEN");
   // Realized P&L includes locked-in income from rolled OPEN positions, not just closed ones.
   const realized = positions.reduce((s, p) => s + (p.total_realized_pnl || 0), 0);
 
@@ -78,50 +129,24 @@ function Holdings() {
           : err ? <div className="empty" style={{ color: "var(--red)" }}>⚠️ {err}</div>
           : positions.length === 0 ? <div className="empty">No positions yet. Approve a screener candidate to open one.</div>
           : (
-            <table className="holdings-table">
-              <thead><tr>
-                <th>Symbol</th><th>Status</th><th>Shares</th><th>Cost basis</th>
-                <th>Current price</th><th>Short call</th><th>Expiration</th><th>Premium</th><th>Buffer</th>
-                <th>Realized P&amp;L</th><th>Annualized</th>
-              </tr></thead>
-              <tbody>
-                {positions.map(p => (
-                  <tr key={p.position_id}>
-                    <td><b>{p.symbol}</b><div className="muted">{p.position_id}</div></td>
-                    <td><span className={"pill " + (p.status === "OPEN" ? "open" : "closed")}>{p.status}</span></td>
-                    <td>{p.shares}</td>
-                    <td>{fmtMoney(p.stock_purchase_price)}</td>
-                    <td>
-                      {p.current_price == null ? "—" : fmtMoney(p.current_price)}
-                      {p.unrealized_stock_pnl != null
-                        ? <div className="muted" style={{ color: p.unrealized_stock_pnl >= 0 ? "var(--green)" : "var(--red)" }}>
-                            {(p.unrealized_stock_pnl >= 0 ? "+" : "") + fmtMoney(p.unrealized_stock_pnl)} unrl.
-                          </div>
-                        : null}
-                    </td>
-                    <td>
-                      {p.short_call_strike != null ? fmtMoney(p.short_call_strike) + " call" : "—"}{p.contracts ? ` ×${p.contracts}` : ""}
-                      {(p.status === "OPEN" && p.has_active_call === false)
-                        ? <div className="muted">call expired — shares held</div> : null}
-                    </td>
-                    <td>{expOf(p.short_call_expiration)}</td>
-                    <td>{p.short_call_premium != null ? fmtMoney(p.short_call_premium) : "—"}</td>
-                    <td>{fmtPct(p.downside_buffer_percent)}</td>
-                    <td style={{ color: (p.total_realized_pnl || 0) > 0 ? "var(--green)" : (p.total_realized_pnl || 0) < 0 ? "var(--red)" : "inherit" }}>
-                      {(p.status === "OPEN" && !p.total_realized_pnl) ? "—" : fmtMoney(p.total_realized_pnl)}
-                      {(p.status === "OPEN" && p.total_realized_pnl)
-                        ? <div className="muted">{p.has_active_call === false ? "premium (call expired)" : "premium collected"}</div>
-                        : null}</td>
-                    <td title={p.return_basis ? `${fmtPct(p.return_percent)} over ${p.days_held}d (${p.return_basis})` : ""}
-                        style={{ color: (p.annualized_return_percent || 0) > 0 ? "var(--green)" : (p.annualized_return_percent || 0) < 0 ? "var(--red)" : "inherit" }}>
-                      {p.annualized_return_percent == null ? "—" : fmtPct(p.annualized_return_percent)}
-                      {p.status === "OPEN" && p.annualized_return_percent != null
-                        ? <div className="muted">premium</div> : null}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <React.Fragment>
+              {/* Current (open) holdings — what you actually own right now. */}
+              <div className="section-label">Current holdings ({open.length})</div>
+              {open.length === 0
+                ? <div className="empty">No open positions — nothing currently held.</div>
+                : <PositionsTable rows={open} />}
+
+              {/* Closed positions live in their own collapsed section. */}
+              {closed.length > 0 && (
+                <div style={{ marginTop: 20 }}>
+                  <button className="wf-btn" style={{ width: "auto", padding: "6px 12px" }}
+                          onClick={() => setShowClosed(v => !v)}>
+                    {showClosed ? "▾" : "▸"} Closed positions ({closed.length})
+                  </button>
+                  {showClosed && <div style={{ marginTop: 10 }}><PositionsTable rows={closed} /></div>}
+                </div>
+              )}
+            </React.Fragment>
           )}
       </div>
     </div>

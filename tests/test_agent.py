@@ -200,6 +200,83 @@ def test_agent_guard_blocks_hallucinated_change():
         os.path.exists(db) and os.unlink(db)
 
 
+def test_agent_breaks_out_of_update_list_loop():
+    # Reproduces the reported loop: the model keeps alternating
+    # update_holding_status → list_holdings and never finalizes. The agent must
+    # NOT re-run the already-succeeded update (no duplicate legs) and must
+    # short-circuit the repeated calls.
+    db = _db()
+    try:
+        import sqlite3
+        svc = ManagementService(db_path=db)
+        svc.set_cash(50_000)
+        ds.open_position(position_id="P_1", symbol="P", stock_purchase_price=69.5, shares=100,
+                         call_strike=72.5, call_premium=1.0, call_expiration="2026-07-28", db_path=db)
+        tools = build_tools(svc)
+        upd = '{"tool": "update_holding_status", "args": {"status": "ASSIGNED", "symbol": "P"}}'
+        lst = '{"tool": "list_holdings", "args": {}}'
+        llm = _scripted_llm([upd, lst, upd, lst, upd, lst])   # stuck model, never finalizes
+        out = CoveredCallAgent(llm, tools).chat("P got executed, record it")
+
+        upd_steps = [s for s in out["steps"] if s["tool"] == "update_holding_status"]
+        # First update actually closed the position; later ones were short-circuited.
+        assert upd_steps[0]["observation"].get("status") == "ASSIGNED"
+        assert any(s["observation"].get("already_done") for s in upd_steps[1:])
+        assert any(s["observation"].get("loop_detected") for s in out["steps"]
+                   if s["tool"] == "list_holdings")
+        # DB is correct and NOT corrupted: exactly one stock sale leg.
+        conn = ds._connect(db)
+        n_stc = conn.execute("SELECT COUNT(*) FROM transactions WHERE position_id='P_1' "
+                             "AND action='SELL_TO_CLOSE'").fetchone()[0]
+        conn.close()
+        assert n_stc == 1
+        assert svc.list_holdings("ASSIGNED")["positions"][0]["symbol"] == "P"
+    finally:
+        os.path.exists(db) and os.unlink(db)
+
+
+def test_liquidate_tool_autofills_market_price():
+    # "sell my stock" → LIQUIDATED with the current market price auto-filled (a
+    # loss when the stock is below cost), NOT the strike.
+    db = _db()
+    try:
+        svc = ManagementService(db_path=db)
+        svc.set_cash(50_000)
+        ds.open_position(position_id="IONQ_1", symbol="IONQ", stock_purchase_price=53.55, shares=100,
+                         call_strike=55.0, call_premium=3.4, call_expiration="2026-08-21", db_path=db)
+        # Fake market client returning the current price ($41.67 < cost).
+        class _Mkt:
+            def get_quotes(self, syms, **kw): return {s.upper(): {} for s in syms}
+            def extract_fundamentals(self, q, sym): return {"last_price": 41.67}
+        import app.agent.tools as T
+        T._CLIENTS["schwab"] = _Mkt()
+        try:
+            tools = build_tools(svc)
+            out = tools["update_holding_status"].run(status="LIQUIDATED", symbol="IONQ")
+            # Sold at market 41.67 (not the $55 strike) → a realized LOSS.
+            assert out["total_realized_pnl"] < 0
+        finally:
+            T._CLIENTS.pop("schwab", None)
+    finally:
+        os.path.exists(db) and os.unlink(db)
+
+
+def test_update_holding_status_idempotent():
+    # Calling it twice for an already-closed position is a clean no-op, not an error.
+    db = _db()
+    try:
+        svc = ManagementService(db_path=db)
+        svc.set_cash(50_000)
+        ds.open_position(position_id="P_1", symbol="P", stock_purchase_price=69.5, shares=100,
+                         call_strike=72.5, call_premium=1.0, call_expiration="2026-07-28", db_path=db)
+        first = svc.update_holding_status(status="ASSIGNED", symbol="P")
+        assert first.get("status") == "ASSIGNED" and not first.get("error")
+        second = svc.update_holding_status(status="ASSIGNED", symbol="P")
+        assert second.get("already_done") is True and not second.get("error")
+    finally:
+        os.path.exists(db) and os.unlink(db)
+
+
 def test_agent_filters_bad_args():
     db = _db()
     try:

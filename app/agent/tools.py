@@ -198,6 +198,22 @@ def _run_performance_review(period: str = "weekly") -> Dict[str, Any]:
 
 # ── registry builders ──────────────────────────────────────────────────
 def _management_tools(service: Any) -> List[Tool]:
+    def _update_holding_status(**kw):
+        # For a market sale (LIQUIDATED) with no price supplied, auto-fill the
+        # CURRENT market price from live data — "sell my stock" means sell at
+        # market, not at the strike (that's ASSIGNED). Without this the agent
+        # tended to fall back to ASSIGNED and book a wrong gain.
+        if str(kw.get("status", "")).upper() == "LIQUIDATED" and not kw.get("stock_sale_price"):
+            sym = kw.get("symbol")
+            if sym:
+                try:
+                    px = _schwab().extract_fundamentals(_schwab().get_quotes([sym]), sym).get("last_price")
+                    if px and px > 0:
+                        kw["stock_sale_price"] = float(px)
+                except Exception:  # noqa: BLE001 — fall through; service will ask for a price
+                    pass
+        return service.update_holding_status(**kw)
+
     return [
         Tool("get_cash", "Get the current account cash balance (USD).", _obj({}),
              lambda: service.get_cash()),
@@ -209,18 +225,18 @@ def _management_tools(service: Any) -> List[Tool]:
         Tool("get_position", "Get one position by id.", _obj({"position_id": _STR}, ["position_id"]),
              lambda position_id: service.get_position(position_id)),
         Tool("update_holding_status",
-             "RECORD an executed/closed trade for a holding. Use this whenever the user says a "
-             "position was executed, assigned, called away, sold, liquidated, or expired, or to "
-             "close a position. Identify the holding by `symbol` OR `position_id`. status is one of: "
-             "EXPIRED (the CALL expired worthless — KEEP the premium as realized gain and RETAIN the "
-             "shares; do NOT sell stock and do NOT pass stock_sale_price), "
-             "ASSIGNED (called away — shares sold at the strike; sale price defaults to the strike), "
-             "LIQUIDATED (you sold the shares on the market — needs stock_sale_price). "
-             "Only ASSIGNED and LIQUIDATED sell the stock. Updates cash + realized P&L. "
-             "Call once PER holding.",
+             "RECORD an executed/closed trade for a holding. Identify it by `symbol` OR "
+             "`position_id`. Choose status by WHAT HAPPENED: "
+             "SOLD / 'sell my stock' / sold on the market → LIQUIDATED (records the sale at the "
+             "CURRENT market price automatically — do NOT pass the strike). "
+             "CALLED AWAY / assigned / exercised → ASSIGNED (shares sold at the strike). "
+             "Call EXPIRED WORTHLESS (shares kept) → EXPIRED. "
+             "Only ASSIGNED and LIQUIDATED sell the stock. For LIQUIDATED the market price is "
+             "auto-filled from live data if you don't pass stock_sale_price. Updates cash + "
+             "realized P&L. Call once PER holding.",
              _obj({"status": _STR, "symbol": _STR, "position_id": _STR, "stock_sale_price": _NUM,
                    "call_buyback_price": _NUM, "contracts": _INT}, ["status"]),
-             lambda **kw: service.update_holding_status(**kw)),
+             _update_holding_status),
         Tool("recent_decisions", "List recent approve/deny decisions.", _obj({"n": _INT}),
              lambda n=10: service.recent_decisions(n)),
         Tool("search_learnings", "Semantic search of past trade lessons / performance reports.",

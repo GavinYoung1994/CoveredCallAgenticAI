@@ -202,7 +202,13 @@ class Settings:
             / _get("LLM_MODEL_PATH", "model/qwen2.5-coder-14b-instruct-q4_k_m.gguf")
         )
     )
-    llm_context_size: int = field(default_factory=lambda: int(_get("LLM_CONTEXT_SIZE", "50000")))
+    # The model trains to 131072 tokens, but a large KV cache + compute buffers
+    # for a 14B model on Metal exceed this machine's memory around n_ctx≈32768 and
+    # crash mid-decode with a fatal `llama_decode returned -3`. 16384 is verified
+    # stable across repeated agent calls and is ample (the system prompt + tool
+    # catalog + truncated observations fit easily). Raise cautiously; lower to 8192
+    # if you still hit memory limits (each halving ~halves the KV cache).
+    llm_context_size: int = field(default_factory=lambda: int(_get("LLM_CONTEXT_SIZE", "16384")))
     llm_gpu_layers: int = field(default_factory=lambda: int(_get("LLM_GPU_LAYERS", "-1")))
     llm_temperature: float = field(default_factory=lambda: float(_get("LLM_TEMPERATURE", "0.2")))
 
