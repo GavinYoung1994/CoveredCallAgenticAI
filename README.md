@@ -25,6 +25,7 @@ cp .env.example .env          # then fill in real values (see below)
 | `SCHWAB_APP_KEY` / `SCHWAB_APP_SECRET` | Prices & option chains **only if** `MARKET_DATA_PROVIDER=schwab` | Schwab developer portal (see §2) |
 | `SCHWAB_REDIRECT_URI` | OAuth (Schwab provider only) | Must match the redirect registered on your Schwab app |
 | `FINNHUB_API_KEY` | Earnings guardrail (primary) | finnhub.io free key (optional — without it, earnings falls back to Google-search, then "unknown → flagged") |
+| `EARNINGS_PROVIDER` | Which earnings source to try first: `finnhub` (default) or `massive` | optional — the other provider stays as a fallback |
 | `DISCORD_WEBHOOK_URL` | HITL alerts | Discord → Server Settings → Integrations → Webhooks |
 
 > **Market-data provider:** the system defaults to **massive.com** (Polygon-compatible) for prices, option chains, historical bars, and technical indicators. Schwab remains available as a drop-in fallback via `MARKET_DATA_PROVIDER=schwab` (requires the OAuth setup in §2). Earnings uses Finnhub first, then Massive/Benzinga (if entitled), then a Google-search LLM engine.

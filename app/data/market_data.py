@@ -31,3 +31,24 @@ def get_market_data_client(provider: str | None = None, **kwargs) -> Any:
     from app.data.massive_client import MassiveClient
     logger.info("Market-data provider: Massive.")
     return MassiveClient(**kwargs)
+
+
+def get_earnings_client(llm: Any = None, provider: str | None = None) -> Any:
+    """Return the composite earnings-date client with the configured PRIMARY
+    provider tried first (``EARNINGS_PROVIDER`` = 'finnhub' | 'massive'), the
+    other kept as a fallback, then the Google-search engine if enabled. Each
+    provider degrades to None (unknown → flagged) so the chain never crashes."""
+    from app.data.earnings_client import EarningsClient
+    from app.data.massive_earnings import MassiveEarningsClient
+    from app.data.earnings_search import EarningsSearchClient, CompositeEarningsClient
+
+    name = (provider or settings.earnings_provider or "finnhub").strip().lower()
+    finnhub, massive = EarningsClient(), MassiveEarningsClient()
+    providers = [massive, finnhub] if name == "massive" else [finnhub, massive]
+    if name not in ("finnhub", "massive"):
+        logger.warning("Unknown EARNINGS_PROVIDER %r; defaulting to Finnhub first.", name)
+    logger.info("Earnings provider order: %s",
+                ", ".join(type(p).__name__ for p in providers))
+    if settings.earnings_search_enabled:
+        providers.append(EarningsSearchClient(llm=llm))
+    return CompositeEarningsClient(providers)

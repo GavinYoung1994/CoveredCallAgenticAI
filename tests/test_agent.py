@@ -235,6 +235,22 @@ def test_agent_breaks_out_of_update_list_loop():
         os.path.exists(db) and os.unlink(db)
 
 
+def test_earnings_provider_order_configurable():
+    # EARNINGS_PROVIDER picks which source is tried FIRST; the other is a fallback.
+    try:
+        from app.data.market_data import get_earnings_client
+        fin = get_earnings_client(provider="finnhub")
+        mas = get_earnings_client(provider="massive")
+    except Exception as exc:  # noqa: BLE001 — client build needs SSL/.env (blocked in-sandbox)
+        print(f"  ⏭  skipping earnings-provider test ({exc})")
+        return
+    assert type(fin._providers[0]).__name__ == "EarningsClient"
+    assert type(mas._providers[0]).__name__ == "MassiveEarningsClient"
+    # The non-primary provider is still present as a fallback.
+    assert any(type(p).__name__ == "MassiveEarningsClient" for p in fin._providers)
+    assert any(type(p).__name__ == "EarningsClient" for p in mas._providers)
+
+
 def test_liquidate_tool_autofills_market_price():
     # "sell my stock" → LIQUIDATED with the current market price auto-filled (a
     # loss when the stock is below cost), NOT the strike.

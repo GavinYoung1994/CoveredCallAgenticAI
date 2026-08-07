@@ -104,10 +104,25 @@ def _select_contract(client: SchwabClient, sym: str, from_date: str, to_date: st
 
 
 def _ensure_liquid(contract: Dict[str, Any], rules) -> Dict[str, Any]:
-    """Bid-ask spread + open-interest + volume guards. Returns the liquidity dict."""
-    liq = eng.calculate_liquidity_slippage(contract["bid"], contract["ask"], rules.max_bid_ask_spread_pct)
-    if not liq.get("is_tradable"):
-        raise _Reject(f"Illiquid option: {liq.get('rejection_reason')}")
+    """Liquidity guard: bid-ask spread + open-interest + volume.
+
+    The bid-ask SPREAD check only applies when a live NBBO quote exists (ask > 0).
+    Outside market hours — or on data feeds that zero the quote when closed —
+    bid/ask come back as 0 even for very liquid contracts; that is NOT illiquidity,
+    so we skip the spread check and rely on open interest + volume (the real
+    liquidity signal). This is why every symbol was being rejected with
+    "Illiquid option: None" when the market was closed.
+    """
+    bid = float(contract.get("bid", 0.0) or 0.0)
+    ask = float(contract.get("ask", 0.0) or 0.0)
+    if ask > 0:
+        liq = eng.calculate_liquidity_slippage(bid, ask, rules.max_bid_ask_spread_pct)
+        if not liq.get("is_tradable"):
+            raise _Reject(f"Illiquid option: {liq.get('rejection_reason') or liq.get('error')}")
+    else:
+        # No live quote — judge liquidity by OI/volume below.
+        liq = {"bid": bid, "ask": ask, "spread_percent": None, "is_tradable": True,
+               "note": "No live NBBO quote (market likely closed); liquidity judged by OI/volume."}
     if contract["open_interest"] < rules.min_option_open_interest:
         raise _Reject(f"Open interest {contract['open_interest']} < {rules.min_option_open_interest}.")
     if contract["volume"] < rules.min_option_volume:

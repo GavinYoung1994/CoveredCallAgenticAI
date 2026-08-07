@@ -89,11 +89,8 @@ def _news() -> Any:
 
 def _earnings() -> Any:
     if "earnings" not in _CLIENTS:
-        from app.data.earnings_client import EarningsClient
-        from app.data.earnings_search import CompositeEarningsClient, EarningsSearchClient
-        from app.data.massive_earnings import MassiveEarningsClient
-        _CLIENTS["earnings"] = CompositeEarningsClient(
-            [EarningsClient(), MassiveEarningsClient(), EarningsSearchClient()])
+        from app.data.market_data import get_earnings_client
+        _CLIENTS["earnings"] = get_earnings_client()
     return _CLIENTS["earnings"]
 
 

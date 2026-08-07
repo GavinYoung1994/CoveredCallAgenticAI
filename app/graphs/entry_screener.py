@@ -19,12 +19,9 @@ from typing import Any, List, Optional
 from langgraph.graph import END, START, StateGraph
 
 from app.config import rules as default_rules
-from app.config import settings
 from app.logging_config import setup_logging
 from app.data.earnings_client import EarningsClient
-from app.data.earnings_search import EarningsSearchClient, CompositeEarningsClient
-from app.data.massive_earnings import MassiveEarningsClient
-from app.data.market_data import get_market_data_client
+from app.data.market_data import get_market_data_client, get_earnings_client
 from app.data.news_client import NewsClient
 from app.data.schwab_client import SchwabClient
 from app.llm import LocalLLM, get_llm
@@ -98,13 +95,9 @@ def run_entry_screener(
     news_client = news_client or NewsClient()
     llm = llm or get_llm()
     if earnings_client is None:
-        # Finnhub first (free, working), then Massive/Benzinga (only reached if
-        # Finnhub misses — avoids a guaranteed 403 when Benzinga isn't entitled),
-        # then the Google-search LLM engine as a last resort.
-        providers = [EarningsClient(), MassiveEarningsClient()]
-        if settings.earnings_search_enabled:
-            providers.append(EarningsSearchClient(llm=llm))
-        earnings_client = CompositeEarningsClient(providers)
+        # Provider order honors EARNINGS_PROVIDER (finnhub|massive); the other is a
+        # fallback, then the Google-search LLM engine as a last resort.
+        earnings_client = get_earnings_client(llm=llm)
     notifier = notifier if notifier is not None else DiscordNotifier()
 
     app = build_entry_screener_graph(

@@ -17,14 +17,10 @@ from typing import Any, Dict, Optional
 from langgraph.graph import END, START, StateGraph
 
 from app.config import rules as default_rules
-from app.config import settings
 from app.logging_config import setup_logging
 from app.data.news_client import NewsClient
 from app.data.schwab_client import SchwabClient
-from app.data.earnings_client import EarningsClient
-from app.data.earnings_search import EarningsSearchClient, CompositeEarningsClient
-from app.data.massive_earnings import MassiveEarningsClient
-from app.data.market_data import get_market_data_client
+from app.data.market_data import get_market_data_client, get_earnings_client
 from app.llm import LocalLLM, get_llm
 from app.nodes.defense import (
     build_defense_quant_node,
@@ -43,13 +39,11 @@ def _route_after_quant(state: DefenseState) -> str:
 
 
 def _default_earnings_client(llm: LocalLLM):
-    """Composite next-earnings provider (Massive/Benzinga → Finnhub → Google+LLM
-    search), same as the entry screener uses. Best-effort; the roll guardrail
-    degrades to no cap if all providers return nothing."""
-    providers = [EarningsClient(), MassiveEarningsClient()]
-    if settings.earnings_search_enabled:
-        providers.append(EarningsSearchClient(llm=llm))
-    return CompositeEarningsClient(providers)
+    """Composite next-earnings provider honoring EARNINGS_PROVIDER (finnhub|massive
+    primary), the other as fallback, then Google+LLM search — same as the entry
+    screener. Best-effort; the roll guardrail degrades to no cap if all return
+    nothing."""
+    return get_earnings_client(llm=llm)
 
 
 def build_defense_monitor_graph(

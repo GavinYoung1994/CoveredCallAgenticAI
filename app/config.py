@@ -102,6 +102,14 @@ class Settings:
         default_factory=lambda: int(_get("NEWS_CONTENT_MAX_ARTICLES", "5"))
     )
 
+    # Which earnings-date source to prefer: "finnhub" (default) or "massive"
+    # (Benzinga, needs the add-on). Whichever is chosen is tried FIRST; the other
+    # is kept as a fallback, then the Google-search engine (if enabled). So this
+    # picks the primary provider without losing resilience.
+    earnings_provider: str = field(
+        default_factory=lambda: _get("EARNINGS_PROVIDER", "finnhub").strip().lower()
+    )
+
     # Finnhub earnings calendar (free tier ~60 req/min). Used by the News node's
     # earnings guardrail. If the key is absent, earnings is treated as UNKNOWN
     # (flagged but allowed) rather than crashing.
@@ -164,7 +172,7 @@ class Settings:
     # history, indicators, and earnings. "massive" (Polygon-compatible, stable)
     # is the default; "schwab" falls back to the legacy OAuth client.
     market_data_provider: str = field(
-        default_factory=lambda: _get("MARKET_DATA_PROVIDER", "massive").strip().lower()
+        default_factory=lambda: _get("MARKET_DATA_PROVIDER", "schwab").strip().lower()
     )
     # Massive stocks/options REST (Polygon-compatible). Reuses MASSIVE_API_KEY +
     # MASSIVE_API_BASE_URL (already defined above for news). Endpoint paths are

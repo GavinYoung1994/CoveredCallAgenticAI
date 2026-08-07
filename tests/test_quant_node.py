@@ -31,10 +31,10 @@ DOWNTREND = [{"close": 130 - i * 0.3} for i in range(90)]
 VOLATILE_UP = [{"close": 100 + i * 0.3 + (5 if i % 2 else -5)} for i in range(90)]
 
 
-def _contract(delta, bid, ask, vol, oi=1000, volume=500, strike=105.0):
+def _contract(delta, bid, ask, vol, oi=1000, volume=500, strike=105.0, mark=None):
     return [{
         "symbol": f"OPT_{strike}", "delta": delta, "bid": bid, "ask": ask,
-        "mark": round((bid + ask) / 2, 2), "totalVolume": volume,
+        "mark": mark if mark is not None else round((bid + ask) / 2, 2), "totalVolume": volume,
         "openInterest": oi, "volatility": vol,
     }]
 
@@ -59,6 +59,8 @@ def _handler(request: httpx.Request) -> httpx.Response:
                             "120.0": _contract(0.12, 0.3, 0.35, 25.0)})
         elif sym == "THIN":  # tight spread but tiny open interest
             chain = _chain({"105.0": _contract(0.35, 2.0, 2.1, 25.0, oi=5)})
+        elif sym == "NOQUOTE":  # market closed: bid/ask=0 but valid mark + deep OI/volume
+            chain = _chain({"105.0": _contract(0.35, 0.0, 0.0, 25.0, oi=1000, volume=500, mark=2.05)})
         else:  # GOOD
             chain = _chain({"105.0": _contract(0.35, 2.0, 2.1, 25.0)})
         return httpx.Response(200, json=chain)
@@ -121,6 +123,16 @@ def test_quant_rejects_wide_spread():
     out = _run([("WIDE", 100.0)])
     assert out["quant_candidates"] == []
     assert "Illiquid option" in out["rejected"][0]["reason"]
+
+
+def test_quant_accepts_no_quote_when_liquid_by_oi():
+    # Market closed → bid/ask=0 but the contract has a valid mark and deep OI/volume.
+    # Must PASS (judged liquid by OI/volume), not reject as "Illiquid option: None".
+    out = _run([("NOQUOTE", 100.0)])
+    assert len(out["quant_candidates"]) == 1
+    c = out["quant_candidates"][0]
+    assert c["symbol"] == "NOQUOTE"
+    assert c["yield_metrics"]["aroc_if_assigned_percent"] > 0   # used the mark as the premium
 
 
 def test_quant_rejects_low_iv():
